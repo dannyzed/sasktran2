@@ -28,6 +28,7 @@ from ._version import __version__
 from .atmosphere import Atmosphere
 from .output import Output, OutputIdeal
 from .engine import Engine
+from .pca import PCAEngine
 from .geodetic import WGS84, SphericalGeoid
 
 from . import appconfig, climatology, constituent, mie, optical, test_util, util
