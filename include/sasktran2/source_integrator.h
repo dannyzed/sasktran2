@@ -3,6 +3,7 @@
 #include <sasktran2/internal_common.h>
 #include <sasktran2/raytracing.h>
 #include <sasktran2/source_interface.h>
+#include <sasktran2/autodiff/operation.h>
 
 namespace sasktran2 {
 
@@ -102,6 +103,13 @@ namespace sasktran2 {
                        std::vector<SourceTermInterface<NSTOKES>*> source_terms,
                        int wavelidx, int rayidx, int wavel_threadidx,
                        int threadidx);
+
+        void generate_integrate_expression(
+            sasktran2::autodiff::ExprPtr& expr,
+            sasktran2::Dual<double, sasktran2::dualstorage::dense, NSTOKES>&
+                radiance,
+            std::vector<SourceTermInterface<NSTOKES>*> source_terms,
+            int wavelidx, int rayidx, int wavel_threadidx, int threadidx);
 
         void integrate_and_emplace_accumulation_triplets(
             sasktran2::Dual<double, sasktran2::dualstorage::dense, NSTOKES>&

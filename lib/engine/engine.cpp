@@ -1,3 +1,4 @@
+#include "sasktran2/autodiff/operation.h"
 #include "sasktran2/do_source.h"
 #include "sasktran2/geometry.h"
 #include "sasktran2/raytracing.h"
@@ -259,10 +260,20 @@ void Sasktran2<NSTOKES>::calculate_radiance(
             radiance[ray_threadidx].value.setZero();
             radiance[ray_threadidx].deriv.setZero();
 
+            sasktran2::autodiff::ExprPtr expr =
+                std::make_shared<sasktran2::autodiff::NullExpression>(
+                    sasktran2::autodiff::AutoDiffMode::Forward);
+
             // Integrate all of the sources for the ray
-            m_source_integrator->integrate(radiance[ray_threadidx],
-                                           m_los_source_terms, w, i, thread_idx,
-                                           ray_threadidx);
+            // m_source_integrator->integrate(radiance[ray_threadidx],
+            //                               m_los_source_terms, w, i,
+            //                               thread_idx, ray_threadidx);
+
+            m_source_integrator->generate_integrate_expression(
+                expr, radiance[ray_threadidx], m_los_source_terms, w, i,
+                thread_idx, ray_threadidx);
+
+            expr->forward();
 
             // Add on any start of ray sources
             for (const SourceTermInterface<NSTOKES>* source :

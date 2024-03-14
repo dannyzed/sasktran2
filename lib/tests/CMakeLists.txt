@@ -2,6 +2,7 @@ add_executable(
   sasktran2_tests
   test_main.cpp
   dual/test_dual.cpp
+  autodiff/test_standalone_expressions.cpp
   viewinggeometry/test_tangentaltitude.cpp
   viewinggeometry/test_groundviewing.cpp
   unitsphere/test_lebedev.cpp

@@ -1,12 +1,206 @@
+#include "sasktran2/atmosphere/grid_storage.h"
 #include "sasktran2/raytracing.h"
 #include "sasktran2/source_algorithms.h"
 #include <sasktran2/solartransmission.h>
 #include <sasktran2/dual.h>
+#include <sasktran2/autodiff/operation.h>
 #include <sasktran2/config.h>
 #include <sasktran2/atmosphere/atmosphere.h>
 #include <sasktran2/math/trig.h>
 
 namespace sasktran2::solartransmission {
+    template <typename S, int NSTOKES>
+    struct AddIntegratedSourceExpression : autodiff::UnaryExpression {
+        int wavelidx;
+        int losidx;
+        int layeridx;
+        int wavel_threadidx;
+        int threadidx;
+        const sasktran2::raytracing::SphericalLayer& layer;
+        sasktran2::SparseODDualView shell_od;
+        sasktran2::Dual<double, sasktran2::dualstorage::dense, NSTOKES>& source;
+        int exit_index;
+        int entrance_index;
+        double solar_trans_exit;
+        double solar_trans_entrance;
+
+        const sasktran2::atmosphere::PhaseInterpolator<NSTOKES, true>&
+            phase_interp;
+        sasktran2::Dual<double, sasktran2::dualstorage::dense, NSTOKES>&
+            start_phase;
+        sasktran2::Dual<double, sasktran2::dualstorage::dense, NSTOKES>&
+            end_phase;
+
+        const Eigen::SparseMatrix<double, Eigen::RowMajor>& geometry_sparse;
+
+        const sasktran2::atmosphere::Atmosphere<NSTOKES>& atmosphere;
+        const sasktran2::Config& config;
+
+        AddIntegratedSourceExpression(
+            autodiff::ExprPtr p, int wavelidx, int losidx, int layeridx,
+            int wavel_threadidx, int threadidx,
+            const sasktran2::raytracing::SphericalLayer& layer,
+            const sasktran2::SparseODDualView& shell_od,
+            sasktran2::Dual<double, sasktran2::dualstorage::dense, NSTOKES>&
+                source,
+            int exit_index, int entrance_index, double solar_trans_exit,
+            double solar_trans_entrance,
+            const sasktran2::atmosphere::PhaseInterpolator<NSTOKES, true>&
+                phase_interp,
+            sasktran2::Dual<double, sasktran2::dualstorage::dense, NSTOKES>&
+                start_phase,
+            sasktran2::Dual<double, sasktran2::dualstorage::dense, NSTOKES>&
+                end_phase,
+            const Eigen::SparseMatrix<double, Eigen::RowMajor>& geometry_sparse,
+            const sasktran2::atmosphere::Atmosphere<NSTOKES>& atmosphere,
+            const sasktran2::Config& config)
+            : autodiff::UnaryExpression(p), wavelidx(wavelidx), losidx(losidx),
+              layeridx(layeridx), wavel_threadidx(wavel_threadidx),
+              threadidx(threadidx), layer(layer), shell_od(shell_od),
+              source(source), exit_index(exit_index),
+              entrance_index(entrance_index),
+              solar_trans_exit(solar_trans_exit),
+              solar_trans_entrance(solar_trans_entrance),
+              phase_interp(phase_interp), start_phase(start_phase),
+              end_phase(end_phase), geometry_sparse(geometry_sparse),
+              atmosphere(atmosphere), config(config) {}
+
+        void forward_impl() override {
+            bool calculate_derivative = source.derivative_size() > 0;
+
+            if (calculate_derivative) {
+                start_phase.deriv.setZero();
+                end_phase.deriv.setZero();
+            }
+
+            double ssa_start = 0;
+            double ssa_end = 0;
+
+            double entrance_factor =
+                solar_trans_entrance / (sasktran2::math::Pi * 4);
+            double exit_factor = solar_trans_exit / (sasktran2::math::Pi * 4);
+
+            start_phase.value.setZero();
+            end_phase.value.setZero();
+
+            // Calculate SSA, don't do derivatives until later
+            for (auto& ele : layer.entrance.interpolation_weights) {
+                ssa_start +=
+                    atmosphere.storage().ssa(ele.first, wavelidx) * ele.second;
+            }
+            for (auto& ele : layer.exit.interpolation_weights) {
+                ssa_end +=
+                    atmosphere.storage().ssa(ele.first, wavelidx) * ele.second;
+            }
+
+            // Incident solar beam is unpolarized
+            start_phase.value(0) = ssa_start * entrance_factor;
+            end_phase.value(0) = ssa_end * exit_factor;
+
+            phase_interp.scatter(atmosphere.storage(), wavelidx,
+                                 layer.entrance.interpolation_weights,
+                                 start_phase);
+            phase_interp.scatter(atmosphere.storage(), wavelidx,
+                                 layer.exit.interpolation_weights, end_phase);
+
+            if (calculate_derivative) {
+                if constexpr (std::is_same_v<S, SolarTransmissionExact>) {
+                    if (config.wf_precision() !=
+                        sasktran2::Config::WeightingFunctionPrecision::
+                            limited) {
+                        // Have to apply the solar transmission derivative
+                        // factors
+                        for (Eigen::SparseMatrix<double,
+                                                 Eigen::RowMajor>::InnerIterator
+                                 it(geometry_sparse, entrance_index);
+                             it; ++it) {
+                            start_phase.deriv(Eigen::all, it.index()) -=
+                                it.value() * start_phase.value;
+                        }
+
+                        for (Eigen::SparseMatrix<double,
+                                                 Eigen::RowMajor>::InnerIterator
+                                 it(geometry_sparse, exit_index);
+                             it; ++it) {
+                            end_phase.deriv(Eigen::all, it.index()) -=
+                                it.value() * end_phase.value;
+                        }
+                    }
+                }
+
+                // And SSA derivative factors
+                for (auto& ele : layer.entrance.interpolation_weights) {
+                    start_phase.deriv(Eigen::all,
+                                      atmosphere.ssa_deriv_start_index() +
+                                          ele.first) +=
+                        ele.second * start_phase.value / ssa_start;
+                }
+                for (auto& ele : layer.exit.interpolation_weights) {
+                    end_phase.deriv(Eigen::all,
+                                    atmosphere.ssa_deriv_start_index() +
+                                        ele.first) +=
+                        ele.second * end_phase.value / ssa_end;
+                }
+            }
+
+            // if(layer.type == raytracing::tangent) {
+            //     sasktran2::sourcealgo::add_integrated_constant_source(shell_od,
+            //     start_phase, end_phase, layer.od_quad_start_fraction,
+            //     layer.od_quad_end_fraction, source);
+            // } else {
+            //     sasktran2::sourcealgo::add_integrated_exponential_source(shell_od,
+            //     start_phase, end_phase, source);
+            // }
+            // return;
+
+            double source_factor1 = (1 - shell_od.exp_minus_od);
+            // Note dsource_factor = d_od * (1 - source_factor)
+
+            // Get the phase matrix and add on the sources
+            // The source factor term will only have extinction derivatives, the
+            // phase term will have local SSA/scattering derivatives and is
+            // ~dense in a 1D atmosphere
+
+            source.value.array() +=
+                source_factor1 *
+                (start_phase.value.array() * layer.od_quad_start_fraction +
+                 end_phase.value.array() * layer.od_quad_end_fraction);
+
+            if (calculate_derivative) {
+                // Now for the derivatives, start with dsource_factor which is
+                // sparse
+                for (auto it = shell_od.deriv_iter; it; ++it) {
+                    source.deriv(Eigen::all, it.index()).array() +=
+                        it.value() * (1 - source_factor1) *
+                        (start_phase.value.array() *
+                             layer.od_quad_start_fraction +
+                         end_phase.value.array() * layer.od_quad_end_fraction);
+                }
+                // And add on d_phase
+                source.deriv.array() +=
+                    source_factor1 * start_phase.deriv.array() *
+                        layer.od_quad_start_fraction +
+                    source_factor1 * end_phase.deriv.array() *
+                        layer.od_quad_end_fraction;
+            }
+
+#ifdef SASKTRAN_DEBUG_ASSERTS
+            if (source.value.hasNaN()) {
+                static bool message = false;
+                if (!message) {
+                    spdlog::error("SS Source NaN {} {}", source_factor1,
+                                  layer.od_quad_start_fraction);
+                    message = true;
+                }
+            }
+#endif
+        }
+
+        void backward_impl() override {
+            // Do nothing
+        }
+    };
+
     template <typename S, int NSTOKES>
     void SingleScatterSource<S, NSTOKES>::initialize_atmosphere(
         const sasktran2::atmosphere::Atmosphere<NSTOKES>& atmosphere) {
@@ -357,6 +551,17 @@ namespace sasktran2::solartransmission {
         auto& start_phase = m_start_source_cache[threadidx];
         auto& end_phase = m_end_source_cache[threadidx];
 
+        sasktran2::autodiff::ExprPtr expr =
+            std::make_shared<AddIntegratedSourceExpression<S, NSTOKES>>(
+                nullptr, wavelidx, losidx, layeridx, wavel_threadidx, threadidx,
+                layer, shell_od, source, exit_index, entrance_index,
+                solar_trans_exit, solar_trans_entrance, phase_interp,
+                start_phase, end_phase, m_geometry_sparse, *m_atmosphere,
+                *m_config);
+
+        expr->forward();
+        return;
+
         if (calculate_derivative) {
             start_phase.deriv.setZero();
             end_phase.deriv.setZero();
@@ -505,6 +710,35 @@ namespace sasktran2::solartransmission {
 
         integrated_source_constant(wavelidx, losidx, layeridx, wavel_threadidx,
                                    threadidx, layer, shell_od, source);
+    }
+
+    template <typename S, int NSTOKES>
+    void SingleScatterSource<S, NSTOKES>::integrated_source_expression(
+        int wavelidx, int losidx, int layeridx, int wavel_threadidx,
+        int threadidx, const sasktran2::raytracing::SphericalLayer& layer,
+        const sasktran2::SparseODDualView& shell_od,
+        sasktran2::Dual<double, sasktran2::dualstorage::dense, NSTOKES>& source,
+        sasktran2::autodiff::ExprPtr& expr) const {
+        // Integrates assuming the source is constant in the layer and
+        // determined by the average of the layer boundaries
+        int exit_index = m_index_map[losidx][layeridx];
+        int entrance_index = m_index_map[losidx][layeridx] + 1;
+
+        double solar_trans_exit = m_solar_trans[wavel_threadidx](exit_index);
+        double solar_trans_entrance =
+            m_solar_trans[wavel_threadidx](entrance_index);
+
+        auto& phase_interp =
+            m_phase_interp[m_phase_index_map[losidx][layeridx]];
+
+        auto& start_phase = m_start_source_cache[threadidx];
+        auto& end_phase = m_end_source_cache[threadidx];
+
+        expr = std::make_shared<AddIntegratedSourceExpression<S, NSTOKES>>(
+            expr, wavelidx, losidx, layeridx, wavel_threadidx, threadidx, layer,
+            shell_od, source, exit_index, entrance_index, solar_trans_exit,
+            solar_trans_entrance, phase_interp, start_phase, end_phase,
+            m_geometry_sparse, *m_atmosphere, *m_config);
     }
 
     template class SingleScatterSource<SolarTransmissionExact, 1>;

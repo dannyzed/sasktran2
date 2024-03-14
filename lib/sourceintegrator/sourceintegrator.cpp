@@ -1,7 +1,35 @@
 
 #include <sasktran2/source_integrator.h>
+#include <sasktran2/autodiff/operation.h>
 
 namespace sasktran2 {
+    template <int NSTOKES>
+    struct AttenuationExpression : autodiff::UnaryExpression {
+        sasktran2::SparseODDualView m_od;
+        sasktran2::Dual<double, sasktran2::dualstorage::dense, NSTOKES>& m_rad;
+
+        AttenuationExpression(
+            autodiff::ExprPtr parent,
+            sasktran2::Dual<double, sasktran2::dualstorage::dense, NSTOKES>&
+                rad,
+            const sasktran2::SparseODDualView& od)
+            : UnaryExpression(parent), m_od(od), m_rad(rad) {}
+
+        void forward_impl() override {
+            if (m_rad.deriv.size() > 0) {
+                for (auto it = m_od.deriv_iter; it; ++it) {
+                    m_rad.deriv(Eigen::all, it.index()) -=
+                        it.value() * m_rad.value;
+                }
+            }
+
+            m_rad.value *= m_od.exp_minus_od;
+            m_rad.deriv *= m_od.exp_minus_od;
+        }
+
+        void backward_impl() override {}
+    };
+
     template <int NSTOKES>
     SourceIntegrator<NSTOKES>::SourceIntegrator(bool calculate_derivatives)
         : m_calculate_derivatives(calculate_derivatives) {}
@@ -47,6 +75,37 @@ namespace sasktran2 {
 
         if (atmo.num_deriv() == 0) {
             m_calculate_derivatives = false;
+        }
+    }
+
+    template <int NSTOKES>
+    void SourceIntegrator<NSTOKES>::generate_integrate_expression(
+        sasktran2::autodiff::ExprPtr& expr,
+        sasktran2::Dual<double, sasktran2::dualstorage::dense, NSTOKES>&
+            radiance,
+        std::vector<SourceTermInterface<NSTOKES>*> source_terms, int wavelidx,
+        int rayidx, int wavel_threadidx, int threadidx) {
+        const auto& ray = (*m_traced_rays)[rayidx];
+        // TOOD: Add source at the end of the ray
+
+        // Iterate through each layer from the end of the ray to the observer
+        for (int j = 0; j < ray.layers.size(); ++j) {
+            const sasktran2::raytracing::SphericalLayer& layer = ray.layers[j];
+
+            sasktran2::SparseODDualView local_shell_od(
+                m_shell_od[rayidx](j, wavelidx),
+                std::exp(-m_shell_od[rayidx](j, wavelidx)),
+                m_traced_ray_od_matrix[rayidx], j);
+
+            // expr = std::make_shared<AttenuationExpression<NSTOKES>>(expr,
+            // radiance, local_shell_od);
+
+            // Calculate all of the layer sources
+            for (const auto& source : source_terms) {
+                source->integrated_source_expression(
+                    wavelidx, rayidx, j, wavel_threadidx, threadidx, layer,
+                    local_shell_od, radiance, expr);
+            }
         }
     }
 

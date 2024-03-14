@@ -3,6 +3,7 @@
 #include <sasktran2/internal_common.h>
 #include <sasktran2/raytracing.h>
 #include <sasktran2/dual.h>
+#include <sasktran2/autodiff/operation.h>
 #include <sasktran2/config.h>
 #include <sasktran2/atmosphere/atmosphere.h>
 
@@ -57,6 +58,13 @@ template <int NSTOKES> class SourceTermInterface {
         const sasktran2::SparseODDualView& shell_od,
         sasktran2::Dual<double, sasktran2::dualstorage::dense, NSTOKES>& source)
         const = 0;
+
+    virtual void integrated_source_expression(
+        int wavelidx, int losidx, int layeridx, int wavel_threadidx,
+        int threadidx, const sasktran2::raytracing::SphericalLayer& layer,
+        const sasktran2::SparseODDualView& shell_od,
+        sasktran2::Dual<double, sasktran2::dualstorage::dense, NSTOKES>& source,
+        sasktran2::autodiff::ExprPtr& expr) const {};
 
     /** Calculates the source term at the end of the ray.  Common examples of
      * this are ground scattering, ground emission, or the solar radiance if
