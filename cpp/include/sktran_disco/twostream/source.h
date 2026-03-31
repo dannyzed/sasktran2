@@ -1,5 +1,6 @@
 #pragma once
 
+#include "meta.h"
 #include "sasktran2/config.h"
 #include "sasktran2/geometry.h"
 #include "sasktran2/math/scattering.h"
@@ -13,13 +14,16 @@
 #include "solutions.h"
 #include <memory>
 
-template <int NSTOKES>
+template <int NSTOKES, sasktran2::twostream::SourceType SOURCE_TYPE>
 class TwoStreamSource : public SourceTermInterface<NSTOKES> {
   private:
-    mutable std::vector<sasktran2::twostream::Solution> m_solutions;
-    std::vector<sasktran2::twostream::Input> m_inputs;
-    mutable std::vector<sasktran2::twostream::Sources> m_sources;
-    mutable std::vector<std::array<Eigen::MatrixXd, 2>> m_bvp_backprop_storage;
+    mutable std::vector<sasktran2::twostream::Solution<SOURCE_TYPE>>
+        m_solutions;
+    std::vector<sasktran2::twostream::Input<SOURCE_TYPE>> m_inputs;
+    mutable std::vector<sasktran2::twostream::Sources<SOURCE_TYPE>> m_sources;
+    mutable std::vector<std::array<
+        Eigen::MatrixXd, sasktran2::twostream::num_azimuth<SOURCE_TYPE>()>>
+        m_bvp_backprop_storage;
 
     const sasktran2::Geometry1D& m_geometry;
     const sasktran2::Config* m_config;
@@ -30,7 +34,9 @@ class TwoStreamSource : public SourceTermInterface<NSTOKES> {
 
     const std::vector<sasktran2::raytracing::TracedRay>* m_los_rays;
 
-    std::vector<Eigen::MatrixXd> m_los_attenuation_factors;
+    std::vector<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic,
+                              Eigen::RowMajorBit>>
+        m_los_attenuation_factors;
     mutable std::vector<Eigen::VectorXd> m_internal_gradients;
 
   public:
@@ -38,6 +44,8 @@ class TwoStreamSource : public SourceTermInterface<NSTOKES> {
         : m_geometry(geometry) {
         m_spec.configure(2, geometry.size() - 1);
     };
+
+    virtual bool requires_integration() const override { return false; }
 
     virtual void initialize_config(const sasktran2::Config& config) {
         m_solutions.resize(config.num_threads());
@@ -52,6 +60,7 @@ class TwoStreamSource : public SourceTermInterface<NSTOKES> {
     virtual void initialize_geometry(
         const sasktran2::viewinggeometry::InternalViewingGeometry&
             internal_viewing) override {
+        ZoneScopedN("Twostream Initialize Geometry");
         m_pconfig.configure(
             m_spec, *m_config, m_geometry.coordinates().cos_sza_at_reference(),
             m_geometry.size() - 1, internal_viewing.traced_rays);
@@ -80,14 +89,17 @@ class TwoStreamSource : public SourceTermInterface<NSTOKES> {
         }
 
         for (auto& backprop : m_bvp_backprop_storage) {
-            backprop[0].resize(2 * (m_geometry.size() - 1), 1);
-            backprop[1].resize(2 * (m_geometry.size() - 1), 1);
+            for (auto& matrix : backprop) {
+                matrix.resize(2 * (m_geometry.size() - 1), 1);
+            }
         }
         m_los_attenuation_factors.resize(m_los_rays->size());
 
         for (int i = 0; i < (*m_los_rays).size(); ++i) {
             const auto& ray = (*m_los_rays)[i];
-            Eigen::MatrixXd& atten_matrix = m_los_attenuation_factors[i];
+            Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic,
+                          Eigen::RowMajorBit>& atten_matrix =
+                m_los_attenuation_factors[i];
             double viewing_secant = 1 / (-ray.observer_and_look.look_away.z());
 
             atten_matrix.resize(m_geometry.size() - 1, m_geometry.size() - 1);
@@ -101,7 +113,14 @@ class TwoStreamSource : public SourceTermInterface<NSTOKES> {
         }
 
         for (auto& internal_gradient : m_internal_gradients) {
-            internal_gradient.resize(3 * m_geometry.size());
+            int nlyr = m_geometry.size() - 1;
+            if constexpr (sasktran2::twostream::has_thermal<SOURCE_TYPE>()) {
+                // +2 for albedo, thermal surface
+                internal_gradient.resize(5 * nlyr + 2);
+            } else {
+                // +1 for albedo
+                internal_gradient.resize(3 * nlyr + 1);
+            }
         }
     };
 
@@ -113,12 +132,19 @@ class TwoStreamSource : public SourceTermInterface<NSTOKES> {
     };
 
     virtual void calculate(int wavelidx, int threadidx) {
+        ZoneScopedN("Twostream Calculate");
         auto& input = m_inputs[threadidx];
         auto& solution = m_solutions[threadidx];
 
-        input.calculate(wavelidx);
+        {
+            ZoneScopedN("Twostream Input Calcultaion");
+            input.calculate(wavelidx);
+        }
 
-        sasktran2::twostream::solve(input, solution);
+        {
+            ZoneScopedN("Twostream Solution");
+            sasktran2::twostream::solve(input, solution);
+        }
     };
 
     virtual void integrated_source(
@@ -156,6 +182,7 @@ class TwoStreamSource : public SourceTermInterface<NSTOKES> {
         int wavelidx, int losidx, int wavel_threadidx, int threadidx,
         sasktran2::Dual<double, sasktran2::dualstorage::dense, NSTOKES>& source)
         const override {
+        ZoneScopedN("Twostream Start of Ray Source");
         auto& sources = m_sources[threadidx];
         const auto& ray = (*m_los_rays)[losidx];
         auto& solution = m_solutions[threadidx];
@@ -174,22 +201,32 @@ class TwoStreamSource : public SourceTermInterface<NSTOKES> {
 
         double azimuth = -ray.observer_and_look.relative_azimuth;
 
-        sources.final_weight_factors.array() =
-            (-m_los_attenuation_factors[losidx] * input.od).array().exp();
+        sources.final_weight_factors.noalias() =
+            (-m_los_attenuation_factors[losidx] * input.od);
+        sources.final_weight_factors =
+            sources.final_weight_factors.array().exp();
 
         sasktran2::twostream::post_process(input, viewing_zenith, azimuth,
                                            solution, sources);
 
         double integrated_source =
-            (solution.particular[0].G_plus_bottom.value(Eigen::last) +
-             solution.bvp_coeffs[0].rhs(Eigen::last - 1, 0) *
-                 solution.homog[0].X_plus.value(Eigen::last) *
-                 solution.homog[0].omega.value(Eigen::last) +
-             solution.bvp_coeffs[0].rhs(Eigen::last, 0) *
-                 solution.homog[0].X_minus.value(Eigen::last)) *
+            (solution.particular[0].G_plus_bottom.value(
+                 Eigen::placeholders::last) +
+             solution.bvp_coeffs[0].rhs(Eigen::placeholders::last - 1, 0) *
+                 solution.homog[0].X_plus.value(Eigen::placeholders::last) *
+                 solution.homog[0].omega.value(Eigen::placeholders::last) +
+             solution.bvp_coeffs[0].rhs(Eigen::placeholders::last, 0) *
+                 solution.homog[0].X_minus.value(Eigen::placeholders::last)) *
             2 * input.mu * input.albedo *
-            sources.final_weight_factors(Eigen::last) *
-            sources.beamtrans.value(Eigen::last);
+            sources.final_weight_factors(Eigen::placeholders::last) *
+            sources.beamtrans.value(Eigen::placeholders::last);
+
+        if constexpr (sasktran2::twostream::has_thermal<SOURCE_TYPE>()) {
+            integrated_source +=
+                input.thermal_surf *
+                sources.final_weight_factors(Eigen::placeholders::last) *
+                sources.beamtrans.value(Eigen::placeholders::last);
+        }
 
         double ground_source = integrated_source;
 
@@ -199,40 +236,49 @@ class TwoStreamSource : public SourceTermInterface<NSTOKES> {
         source.value(0) += integrated_source;
 
         if (input.atmosphere->num_deriv() > 0) {
-            double ground_weight = 2 * input.mu * input.albedo *
-                                   sources.final_weight_factors(Eigen::last) *
-                                   sources.beamtrans.value(Eigen::last);
+            double ground_weight =
+                2 * input.mu * input.albedo *
+                sources.final_weight_factors(Eigen::placeholders::last) *
+                sources.beamtrans.value(Eigen::placeholders::last);
 
-            sasktran2::twostream::backprop::GradientMap grad(
+            sasktran2::twostream::backprop::GradientMap<SOURCE_TYPE> grad(
                 *input.atmosphere, internal_gradient.data());
 
             // assign d_albedo
             grad.d_albedo =
-                (solution.particular[0].G_plus_bottom.value(Eigen::last) +
-                 solution.bvp_coeffs[0].rhs(Eigen::last - 1, 0) *
-                     solution.homog[0].X_plus.value(Eigen::last) *
-                     solution.homog[0].omega.value(Eigen::last) +
-                 solution.bvp_coeffs[0].rhs(Eigen::last, 0) *
-                     solution.homog[0].X_minus.value(Eigen::last)) *
-                2 * input.mu * sources.final_weight_factors(Eigen::last) *
-                sources.beamtrans.value(Eigen::last);
+                (solution.particular[0].G_plus_bottom.value(
+                     Eigen::placeholders::last) +
+                 solution.bvp_coeffs[0].rhs(Eigen::placeholders::last - 1, 0) *
+                     solution.homog[0].X_plus.value(Eigen::placeholders::last) *
+                     solution.homog[0].omega.value(Eigen::placeholders::last) +
+                 solution.bvp_coeffs[0].rhs(Eigen::placeholders::last, 0) *
+                     solution.homog[0].X_minus.value(
+                         Eigen::placeholders::last)) *
+                2 * input.mu *
+                sources.final_weight_factors(Eigen::placeholders::last) *
+                sources.beamtrans.value(Eigen::placeholders::last);
+
+            if constexpr (sasktran2::twostream::has_thermal<SOURCE_TYPE>()) {
+                grad.d_thermal_surf =
+                    sources.final_weight_factors(Eigen::placeholders::last) *
+                    sources.beamtrans.value(Eigen::placeholders::last);
+            }
 
             sasktran2::twostream::backprop::full(
                 input, solution, sources, sources.final_weight_factors,
                 m_bvp_backprop_storage[threadidx], grad, ground_weight);
 
-            // Backprop the attenuation factors
-            for (int i = 0; i < input.nlyr; ++i) {
-                // sasktran2::twostream::backprop::od(input,
-                // (-sources.final_weight_factors(i) *
-                // sources.source.value).transpose().cwiseProduct(m_los_attenuation_factors[losidx].row(i)),
-                // grad);
-                sasktran2::twostream::backprop::od(
-                    input,
-                    (-sources.final_weight_factors(i) *
-                     sources.source.value(i) *
-                     m_los_attenuation_factors[losidx].row(i)),
-                    grad);
+            {
+                ZoneScopedN("Twostream Backprop Attenuation");
+                // Backprop the attenuation factors
+                for (int i = 0; i < input.nlyr; ++i) {
+                    sasktran2::twostream::backprop::od(
+                        input,
+                        (-sources.final_weight_factors(i) *
+                         sources.source.value(i) *
+                         m_los_attenuation_factors[losidx].row(i)),
+                        grad);
+                }
             }
 
             // Backprop ground source LOS attenuation

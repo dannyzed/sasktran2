@@ -3,9 +3,211 @@
 #include <cstddef>
 #include <sasktran2/internal_common.h>
 #include "sktran_disco/sktran_do_types.h"
+#include "sktran_disco/twostream/meta.h"
 #include "storage.h"
 
 namespace sasktran2::twostream {
+
+    /**
+     * Solves the pentadiagonal system (single RHS column).
+     *
+     * Compile-time transpose (Transpose template parameter) so the diagonal
+     * access resolves with if constexpr and the compiler can fully specialize.
+     *
+     * Notes:
+     * - Assumes rhs is N x 1.
+     * - Uses raw pointers + scalar loops (Eigen used as storage only).
+     * - Avoids unsafe Maps like (data()-1)/(data()-2).
+     * - Reduces divides via inv_mu.
+     */
+    template <SourceType source_type, bool Transpose>
+    inline int pentadiagonal_solve(BVPCoeffs<source_type>& bvp,
+                                   Eigen::Ref<Eigen::MatrixXd> rhs) {
+        ZoneScopedN("Twostream Pentadiagonal Solve");
+
+        const int N = static_cast<int>(bvp.d.size());
+        if (N <= 0)
+            return 0;
+
+#ifdef SASKTRAN_DEBUG_ASSERTS
+        if (rhs.rows() != N || rhs.cols() != 1) {
+            spdlog::error(
+                "pentadiagonal_solve: rhs must be N x 1 (N={}), got {}x{}", N,
+                rhs.rows(), rhs.cols());
+            return -1;
+        }
+#endif
+
+        // Main diagonal
+        const double* __restrict d = bvp.d.data();
+
+        // Work arrays (size N)
+        double* __restrict mu = bvp.mu.data();
+        double* __restrict alpha = bvp.alpha.data();
+        double* __restrict beta = bvp.beta.data();
+        double* __restrict gamma = bvp.gamma.data();
+
+        // Single RHS column, in-place output
+        double* __restrict y = rhs.col(0).data();
+
+        // z: assumed N x 1 (or change to bvp.z.data() if VectorXd)
+        double* __restrict z = bvp.z.col(0).data();
+
+        // Diagonal accessors (compile-time Transpose)
+        auto a_at = [&](int i) -> double {
+            if constexpr (Transpose)
+                return bvp.c[i + 1];
+            else
+                return bvp.a[i];
+        };
+        auto c_at = [&](int i) -> double {
+            if constexpr (Transpose)
+                return bvp.a[i - 1];
+            else
+                return bvp.c[i];
+        };
+        auto b_at = [&](int i) -> double {
+            if constexpr (Transpose)
+                return bvp.e[i + 2];
+            else
+                return bvp.b[i];
+        };
+        auto e_at = [&](int i) -> double {
+            if constexpr (Transpose)
+                return bvp.b[i - 2];
+            else
+                return bvp.e[i];
+        };
+
+        // ---- Forward elimination ----
+        // i = 0
+        {
+            const double mu0 = d[0];
+            mu[0] = mu0;
+            const double inv0 = 1.0 / mu0;
+
+            alpha[0] = a_at(0) * inv0;
+            beta[0] = b_at(0) * inv0;
+            z[0] = y[0] * inv0;
+        }
+
+        if (N == 1) {
+            y[0] = z[0];
+            return 0;
+        }
+
+        // i = 1
+        {
+            const double g1 = c_at(1);
+            gamma[1] = g1;
+
+            const double mu1 = d[1] - alpha[0] * g1;
+            mu[1] = mu1;
+            const double inv1 = 1.0 / mu1;
+
+            alpha[1] = (a_at(1) - beta[0] * g1) * inv1;
+            beta[1] = b_at(1) * inv1;
+            z[1] = (y[1] - z[0] * g1) * inv1;
+        }
+
+        // Main sweep: i = 2 .. N-3
+        for (int i = 2; i < N - 2; ++i) {
+            const double ei = e_at(i);
+
+            const double g = c_at(i) - alpha[i - 2] * ei;
+            gamma[i] = g;
+
+            const double mui = d[i] - beta[i - 2] * ei - alpha[i - 1] * g;
+            mu[i] = mui;
+            const double inv = 1.0 / mui;
+
+            alpha[i] = (a_at(i) - beta[i - 1] * g) * inv;
+            beta[i] = b_at(i) * inv;
+
+            z[i] = (y[i] - z[i - 2] * ei - z[i - 1] * g) * inv;
+        }
+
+        if (N >= 4) {
+            // i = N-2
+            {
+                const int i = N - 2;
+                const double ei = e_at(i);
+
+                const double g = c_at(i) - alpha[i - 2] * ei; // alpha[N-4]
+                gamma[i] = g;
+
+                const double mui = d[i] - beta[i - 2] * ei -
+                                   alpha[i - 1] * g; // beta[N-4], alpha[N-3]
+                mu[i] = mui;
+                const double inv = 1.0 / mui;
+
+                alpha[i] = (a_at(i) - beta[i - 1] * g) * inv; // beta[N-3]
+                z[i] = (y[i] - z[i - 2] * ei - z[i - 1] * g) * inv;
+            }
+
+            // i = N-1
+            {
+                const int i = N - 1;
+                const double ei = e_at(i);
+
+                const double g = c_at(i) - alpha[i - 2] * ei; // alpha[N-3]
+                gamma[i] = g;
+
+                const double mui = d[i] - beta[i - 2] * ei -
+                                   alpha[i - 1] * g; // beta[N-3], alpha[N-2]
+                mu[i] = mui;
+                const double inv = 1.0 / mui;
+
+                z[i] = (y[i] - z[i - 2] * ei - z[i - 1] * g) * inv;
+            }
+        } else {
+            // N == 2 or 3: finish remaining i with the same recurrence
+            for (int i = 2; i < N; ++i) {
+                const double ei = e_at(i);
+
+                const double g = c_at(i) - alpha[i - 2] * ei;
+                gamma[i] = g;
+
+                const double mui = d[i] - beta[i - 2] * ei - alpha[i - 1] * g;
+                mu[i] = mui;
+                const double inv = 1.0 / mui;
+
+                if (i <= N - 2) {
+                    alpha[i] = (a_at(i) - beta[i - 1] * g) * inv;
+                }
+
+                z[i] = (y[i] - z[i - 2] * ei - z[i - 1] * g) * inv;
+            }
+        }
+
+        // ---- Back substitution ----
+        y[N - 1] = z[N - 1];
+
+        if (N >= 2) {
+            y[N - 2] = z[N - 2] - alpha[N - 2] * y[N - 1];
+        }
+
+        for (int i = N - 3; i >= 0; --i) {
+            y[i] = z[i] - alpha[i] * y[i + 1] - beta[i] * y[i + 2];
+        }
+
+#ifdef SASKTRAN_DEBUG_ASSERTS
+        bool any_nan = false;
+        for (int i = 0; i < N; ++i) {
+            if (std::isnan(y[i])) {
+                any_nan = true;
+                break;
+            }
+        }
+        if (any_nan) {
+            spdlog::warn("Pentadiagonal solver failed");
+            for (int i = 0; i < N; ++i)
+                y[i] = 0.0;
+        }
+#endif
+
+        return 0;
+    }
 
     /**
      * Solves the pentadiagonal system
@@ -13,8 +215,11 @@ namespace sasktran2::twostream {
      * @param bvp
      * @return int
      */
-    inline int pentadiagonal_solve(BVPCoeffs& bvp, Eigen::MatrixXd& rhs,
-                                   bool transpose = false) {
+    template <SourceType source_type>
+    inline int pentadiagonal_solve_old(BVPCoeffs<source_type>& bvp,
+                                       Eigen::MatrixXd& rhs,
+                                       bool transpose = false) {
+        ZoneScopedN("Twostream Pentadiagonal Solve");
 
         int N = bvp.a.size();
         // Diagonals are e,c,d,a,b
@@ -47,23 +252,27 @@ namespace sasktran2::twostream {
         alpha(0) = a(0) / mu(0);
 
         beta(0) = b(0) / mu(0);
-        z(0, Eigen::all) = y(0, Eigen::all) / mu(0);
+        z(0, Eigen::placeholders::all) = y(0, Eigen::placeholders::all) / mu(0);
 
         gamma(1) = c(1);
         mu(1) = d(1) - alpha(0) * gamma(1);
         alpha(1) = (a(1) - beta(0) * gamma(1)) / mu(1);
         beta(1) = b(1) / mu(1);
-        z(1, Eigen::all) =
-            (y(1, Eigen::all) - z(0, Eigen::all) * gamma(1)) / mu(1);
+        z(1, Eigen::placeholders::all) =
+            (y(1, Eigen::placeholders::all) -
+             z(0, Eigen::placeholders::all) * gamma(1)) /
+            mu(1);
 
         for (int i = 2; i < N - 2; ++i) {
             gamma(i) = c(i) - alpha(i - 2) * e(i);
             mu(i) = d(i) - beta(i - 2) * e(i) - alpha(i - 1) * gamma(i);
             alpha(i) = (a(i) - beta(i - 1) * gamma(i)) / mu(i);
             beta(i) = b(i) / mu(i);
-            z(i, Eigen::all) = (y(i, Eigen::all) - z(i - 2, Eigen::all) * e(i) -
-                                z(i - 1, Eigen::all) * gamma(i)) /
-                               mu(i);
+            z(i, Eigen::placeholders::all) =
+                (y(i, Eigen::placeholders::all) -
+                 z(i - 2, Eigen::placeholders::all) * e(i) -
+                 z(i - 1, Eigen::placeholders::all) * gamma(i)) /
+                mu(i);
         }
 
         if (N >= 4) {
@@ -77,23 +286,27 @@ namespace sasktran2::twostream {
                 d(N - 1) - beta(N - 3) * e(N - 1) - alpha(N - 2) * gamma(N - 1);
         }
 
-        z(N - 2, Eigen::all) =
-            (y(N - 2, Eigen::all) - z(N - 4, Eigen::all) * e(N - 2) -
-             z(N - 3, Eigen::all) * gamma(N - 2)) /
+        z(N - 2, Eigen::placeholders::all) =
+            (y(N - 2, Eigen::placeholders::all) -
+             z(N - 4, Eigen::placeholders::all) * e(N - 2) -
+             z(N - 3, Eigen::placeholders::all) * gamma(N - 2)) /
             mu(N - 2);
-        z(N - 1, Eigen::all) =
-            (y(N - 1, Eigen::all) - z(N - 3, Eigen::all) * e(N - 1) -
-             z(N - 2, Eigen::all) * gamma(N - 1)) /
+        z(N - 1, Eigen::placeholders::all) =
+            (y(N - 1, Eigen::placeholders::all) -
+             z(N - 3, Eigen::placeholders::all) * e(N - 1) -
+             z(N - 2, Eigen::placeholders::all) * gamma(N - 1)) /
             mu(N - 1);
 
-        y(N - 1, Eigen::all) = z(N - 1, Eigen::all);
-        y(N - 2, Eigen::all) =
-            z(N - 2, Eigen::all) - alpha(N - 2) * y(N - 1, Eigen::all);
+        y(N - 1, Eigen::placeholders::all) = z(N - 1, Eigen::placeholders::all);
+        y(N - 2, Eigen::placeholders::all) =
+            z(N - 2, Eigen::placeholders::all) -
+            alpha(N - 2) * y(N - 1, Eigen::placeholders::all);
 
         for (int i = N - 3; i >= 0; --i) {
-            y(i, Eigen::all) = z(i, Eigen::all) -
-                               alpha(i) * y(i + 1, Eigen::all) -
-                               beta(i) * y(i + 2, Eigen::all);
+            y(i, Eigen::placeholders::all) =
+                z(i, Eigen::placeholders::all) -
+                alpha(i) * y(i + 1, Eigen::placeholders::all) -
+                beta(i) * y(i + 2, Eigen::placeholders::all);
         }
 
         // There are situations where this linear system is underdetermined,
@@ -120,28 +333,39 @@ namespace sasktran2::twostream {
      * @param input
      * @param solution
      */
-    inline void solve_layers(const Input& input, Solution& solution) {
+    template <SourceType source_type>
+    inline void solve_layers(const Input<source_type>& input,
+                             Solution<source_type>& solution) {
+        ZoneScopedN("Twostream Solve Layers");
         solution.homog[0].d.value.array() =
             (input.ssa.array() * input.b1.array() * input.mu - 1 / input.mu);
         solution.homog[0].s.value.array() =
             1 / input.mu * (input.ssa.array() - 1);
 
-        solution.homog[1].d.value.array() = -1 / input.mu;
-        solution.homog[1].s.value.array() =
-            1.0 / (2.0 * input.mu) *
-            (input.ssa.array() * input.b1.array() * (1 - input.mu * input.mu) -
-             2);
+        if constexpr (has_solar<source_type>()) {
+            solution.homog[1].d.value.array() = -1 / input.mu;
+            solution.homog[1].s.value.array() =
+                1.0 / (2.0 * input.mu) *
+                (input.ssa.array() * input.b1.array() *
+                     (1 - input.mu * input.mu) -
+                 2);
+        }
 
         // Gradients of d by ssa
         solution.homog[0].d.d_ssa.array() = input.b1.array() * input.mu;
 
-        solution.homog[1].d.d_ssa.array() = 0;
+        if constexpr (has_solar<source_type>()) {
+            solution.homog[1].d.d_ssa.array() = 0;
+        }
 
         // Gradients of s by ssa
         solution.homog[0].s.d_ssa.array() = 1 / input.mu;
-        solution.homog[1].s.d_ssa.array() = 1.0 / (2.0 * input.mu) *
-                                            input.b1.array() *
-                                            (1 - input.mu * input.mu);
+
+        if constexpr (has_solar<source_type>()) {
+            solution.homog[1].s.d_ssa.array() = 1.0 / (2.0 * input.mu) *
+                                                input.b1.array() *
+                                                (1 - input.mu * input.mu);
+        }
 
         // Gradients of d/s by b1
         solution.homog[0].d.d_b1.array() = input.mu * input.ssa.array();
@@ -149,9 +373,11 @@ namespace sasktran2::twostream {
 
         // solution.homog[0].s.d_b1.array().setZero(); // Should already get set
         // to 0 by default
-        solution.homog[1].s.d_b1.array() = 1.0 / (2.0 * input.mu) *
-                                           input.ssa.array() *
-                                           (1 - input.mu * input.mu);
+        if constexpr (has_solar<source_type>()) {
+            solution.homog[1].s.d_b1.array() = 1.0 / (2.0 * input.mu) *
+                                               input.ssa.array() *
+                                               (1 - input.mu * input.mu);
+        }
 
         for (auto& homog : solution.homog) {
             // Eigenvalue and gradient
@@ -200,48 +426,53 @@ namespace sasktran2::twostream {
                 -homog.omega.value.array() * homog.k.value.array();
         }
 
-        // Q_plus and Q_minus
-        solution.particular[0].Q_plus.value.array() =
-            1.0 / (4 * EIGEN_PI) *
-            (input.ssa.array() +
-             input.b1.array() * input.ssa.array() * input.csz * input.mu);
-        solution.particular[0].Q_minus.value.array() =
-            1.0 / (4 * EIGEN_PI) *
-            (input.ssa.array() -
-             input.b1.array() * input.ssa.array() * input.csz * input.mu);
+        // Only have Q terms when including the solar source
+        if constexpr (has_solar<source_type>()) {
+            // Q_plus and Q_minus
+            solution.particular[0].Q_plus.value.array() =
+                1.0 / (4 * EIGEN_PI) *
+                (input.ssa.array() +
+                 input.b1.array() * input.ssa.array() * input.csz * input.mu);
+            solution.particular[0].Q_minus.value.array() =
+                1.0 / (4 * EIGEN_PI) *
+                (input.ssa.array() -
+                 input.b1.array() * input.ssa.array() * input.csz * input.mu);
 
-        solution.particular[1].Q_plus.value.array() =
-            1.0 / (4 * EIGEN_PI) * input.ssa.array() * input.b1.array() *
-            sqrt(1 - input.mu * input.mu) * sqrt(1 - input.csz * input.csz);
-        solution.particular[1].Q_minus.value.array() =
-            solution.particular[1].Q_plus.value.array();
+            solution.particular[1].Q_plus.value.array() =
+                1.0 / (4 * EIGEN_PI) * input.ssa.array() * input.b1.array() *
+                sqrt(1 - input.mu * input.mu) * sqrt(1 - input.csz * input.csz);
+            solution.particular[1].Q_minus.value.array() =
+                solution.particular[1].Q_plus.value.array();
 
-        // And their gradients
-        solution.particular[0].Q_plus.d_ssa.array() =
-            1.0 / (4.0 * EIGEN_PI) *
-            (1 + input.b1.array() * input.csz * input.mu);
-        solution.particular[0].Q_minus.d_ssa.array() =
-            1.0 / (4.0 * EIGEN_PI) *
-            (1 - input.b1.array() * input.csz * input.mu);
+            // And their gradients
+            solution.particular[0].Q_plus.d_ssa.array() =
+                1.0 / (4.0 * EIGEN_PI) *
+                (1 + input.b1.array() * input.csz * input.mu);
+            solution.particular[0].Q_minus.d_ssa.array() =
+                1.0 / (4.0 * EIGEN_PI) *
+                (1 - input.b1.array() * input.csz * input.mu);
 
-        solution.particular[1].Q_plus.d_ssa.array() =
-            1.0 / (4.0 * EIGEN_PI) * input.b1.array() *
-            sqrt(1 - input.mu * input.mu) * sqrt(1 - input.csz * input.csz);
-        solution.particular[1].Q_minus.d_ssa.array() =
-            solution.particular[1].Q_plus.d_ssa.array();
+            solution.particular[1].Q_plus.d_ssa.array() =
+                1.0 / (4.0 * EIGEN_PI) * input.b1.array() *
+                sqrt(1 - input.mu * input.mu) * sqrt(1 - input.csz * input.csz);
+            solution.particular[1].Q_minus.d_ssa.array() =
+                solution.particular[1].Q_plus.d_ssa.array();
 
-        solution.particular[0].Q_plus.d_b1.array() =
-            1.0 / (4.0 * EIGEN_PI) * input.ssa.array() * input.csz * input.mu;
-        solution.particular[0].Q_minus.d_b1.array() =
-            -1.0 / (4.0 * EIGEN_PI) * input.ssa.array() * input.csz * input.mu;
+            solution.particular[0].Q_plus.d_b1.array() =
+                1.0 / (4.0 * EIGEN_PI) * input.ssa.array() * input.csz *
+                input.mu;
+            solution.particular[0].Q_minus.d_b1.array() =
+                -1.0 / (4.0 * EIGEN_PI) * input.ssa.array() * input.csz *
+                input.mu;
 
-        solution.particular[1].Q_plus.d_b1.array() =
-            1.0 / (4.0 * EIGEN_PI) * input.ssa.array() *
-            sqrt(1 - input.mu * input.mu) * sqrt(1 - input.csz * input.csz);
-        solution.particular[1].Q_minus.d_b1.array() =
-            solution.particular[1].Q_plus.d_b1.array();
+            solution.particular[1].Q_plus.d_b1.array() =
+                1.0 / (4.0 * EIGEN_PI) * input.ssa.array() *
+                sqrt(1 - input.mu * input.mu) * sqrt(1 - input.csz * input.csz);
+            solution.particular[1].Q_minus.d_b1.array() =
+                solution.particular[1].Q_plus.d_b1.array();
+        }
 
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < num_azimuth<source_type>(); ++i) {
             auto& homog = solution.homog[i];
             auto& particular = solution.particular[i];
 
@@ -260,304 +491,588 @@ namespace sasktran2::twostream {
                 (homog.X_plus.value.array() * homog.X_plus.d_b1.array() -
                  homog.X_minus.value.array() * homog.X_minus.d_b1.array());
 
-            // A_plus and A_minus and their gradients by ssa
-            particular.A_plus.value.array() =
-                (particular.Q_plus.value.array() * homog.X_plus.value.array() +
-                 particular.Q_minus.value.array() *
-                     homog.X_minus.value.array()) /
-                particular.norm.value.array();
-            particular.A_minus.value.array() =
-                (particular.Q_minus.value.array() * homog.X_plus.value.array() +
-                 particular.Q_plus.value.array() *
-                     homog.X_minus.value.array()) /
-                particular.norm.value.array();
+            if constexpr (has_solar<source_type>()) {
+                // A_plus and A_minus and their gradients by ssa
+                particular.A_plus.value.array() =
+                    (particular.Q_plus.value.array() *
+                         homog.X_plus.value.array() +
+                     particular.Q_minus.value.array() *
+                         homog.X_minus.value.array()) /
+                    particular.norm.value.array();
+                particular.A_minus.value.array() =
+                    (particular.Q_minus.value.array() *
+                         homog.X_plus.value.array() +
+                     particular.Q_plus.value.array() *
+                         homog.X_minus.value.array()) /
+                    particular.norm.value.array();
 
-            particular.A_plus.d_ssa.array() =
-                (particular.Q_plus.d_ssa.array() * homog.X_plus.value.array() +
-                 particular.Q_minus.d_ssa.array() *
-                     homog.X_minus.value.array() +
-                 particular.Q_plus.value.array() * homog.X_plus.d_ssa.array() +
-                 particular.Q_minus.value.array() *
-                     homog.X_minus.d_ssa.array() -
-                 particular.norm.d_ssa.array() *
-                     particular.A_plus.value.array()) /
-                particular.norm.value.array();
+                particular.A_plus.d_ssa.array() =
+                    (particular.Q_plus.d_ssa.array() *
+                         homog.X_plus.value.array() +
+                     particular.Q_minus.d_ssa.array() *
+                         homog.X_minus.value.array() +
+                     particular.Q_plus.value.array() *
+                         homog.X_plus.d_ssa.array() +
+                     particular.Q_minus.value.array() *
+                         homog.X_minus.d_ssa.array() -
+                     particular.norm.d_ssa.array() *
+                         particular.A_plus.value.array()) /
+                    particular.norm.value.array();
 
-            particular.A_minus.d_ssa.array() =
-                (particular.Q_minus.d_ssa.array() * homog.X_plus.value.array() +
-                 particular.Q_plus.d_ssa.array() * homog.X_minus.value.array() +
-                 particular.Q_minus.value.array() * homog.X_plus.d_ssa.array() +
-                 particular.Q_plus.value.array() * homog.X_minus.d_ssa.array() -
-                 particular.norm.d_ssa.array() *
-                     particular.A_minus.value.array()) /
-                particular.norm.value.array();
+                particular.A_minus.d_ssa.array() =
+                    (particular.Q_minus.d_ssa.array() *
+                         homog.X_plus.value.array() +
+                     particular.Q_plus.d_ssa.array() *
+                         homog.X_minus.value.array() +
+                     particular.Q_minus.value.array() *
+                         homog.X_plus.d_ssa.array() +
+                     particular.Q_plus.value.array() *
+                         homog.X_minus.d_ssa.array() -
+                     particular.norm.d_ssa.array() *
+                         particular.A_minus.value.array()) /
+                    particular.norm.value.array();
 
-            particular.A_plus.d_b1.array() =
-                (particular.Q_plus.d_b1.array() * homog.X_plus.value.array() +
-                 particular.Q_minus.d_b1.array() * homog.X_minus.value.array() +
-                 particular.Q_plus.value.array() * homog.X_plus.d_b1.array() +
-                 particular.Q_minus.value.array() * homog.X_minus.d_b1.array() -
-                 particular.norm.d_b1.array() *
-                     particular.A_plus.value.array()) /
-                particular.norm.value.array();
+                particular.A_plus.d_b1.array() =
+                    (particular.Q_plus.d_b1.array() *
+                         homog.X_plus.value.array() +
+                     particular.Q_minus.d_b1.array() *
+                         homog.X_minus.value.array() +
+                     particular.Q_plus.value.array() *
+                         homog.X_plus.d_b1.array() +
+                     particular.Q_minus.value.array() *
+                         homog.X_minus.d_b1.array() -
+                     particular.norm.d_b1.array() *
+                         particular.A_plus.value.array()) /
+                    particular.norm.value.array();
 
-            particular.A_minus.d_b1.array() =
-                (particular.Q_minus.d_b1.array() * homog.X_plus.value.array() +
-                 particular.Q_plus.d_b1.array() * homog.X_minus.value.array() +
-                 particular.Q_minus.value.array() * homog.X_plus.d_b1.array() +
-                 particular.Q_plus.value.array() * homog.X_minus.d_b1.array() -
-                 particular.norm.d_b1.array() *
-                     particular.A_minus.value.array()) /
-                particular.norm.value.array();
+                particular.A_minus.d_b1.array() =
+                    (particular.Q_minus.d_b1.array() *
+                         homog.X_plus.value.array() +
+                     particular.Q_plus.d_b1.array() *
+                         homog.X_minus.value.array() +
+                     particular.Q_minus.value.array() *
+                         homog.X_plus.d_b1.array() +
+                     particular.Q_plus.value.array() *
+                         homog.X_minus.d_b1.array() -
+                     particular.norm.d_b1.array() *
+                         particular.A_minus.value.array()) /
+                    particular.norm.value.array();
+            }
 
-            // Solution multipliers and their derivatives
-            particular.C_plus.value.array() =
-                input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                (homog.omega.value.array() - input.expsec.array()) /
-                (input.average_secant.array() - homog.k.value.array());
-            particular.C_minus.value.array() =
-                input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                (1 - homog.omega.value.array() * input.expsec.array()) /
-                (input.average_secant.array() + homog.k.value.array());
+            if constexpr (has_thermal<source_type>()) {
+                // For thermal terms, Q = mu * (1.0 - ssa), Qplus and Qminus are
+                // the same
 
-            particular.C_plus.d_ssa.array() =
-                input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                    (homog.omega.d_ssa.array()) /
-                    (input.average_secant.array() - homog.k.value.array()) +
-                homog.k.d_ssa.array() * particular.C_plus.value.array() /
+                particular.A_thermal.value.array() =
+                    input.mu * (1.0 - input.ssa.array()) *
+                    (homog.X_plus.value.array() + homog.X_minus.value.array()) /
+                    particular.norm.value.array();
+
+                particular.A_thermal.d_ssa.array() =
+                    -input.mu *
+                        (homog.X_plus.value.array() +
+                         homog.X_minus.value.array()) /
+                        particular.norm.value.array() +
+                    input.mu * (1.0 - input.ssa.array()) *
+                        (homog.X_plus.d_ssa.array() +
+                         homog.X_minus.d_ssa.array()) /
+                        particular.norm.value.array() -
+                    particular.norm.d_ssa.array() *
+                        particular.A_thermal.value.array() /
+                        particular.norm.value.array();
+            }
+
+            if constexpr (has_solar<source_type>()) {
+                // Solution multipliers and their derivatives
+                particular.C_plus.value.array() =
+                    input
+                        .transmission(
+                            Eigen::seq(0, Eigen::placeholders::last - 1))
+                        .array() *
+                    (homog.omega.value.array() - input.expsec.array()) /
                     (input.average_secant.array() - homog.k.value.array());
-
-            particular.C_minus.d_ssa.array() =
-                input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                    (-homog.omega.d_ssa.array() * input.expsec.array()) /
-                    (input.average_secant.array() + homog.k.value.array()) -
-                homog.k.d_ssa.array() * particular.C_minus.value.array() /
+                particular.C_minus.value.array() =
+                    input
+                        .transmission(
+                            Eigen::seq(0, Eigen::placeholders::last - 1))
+                        .array() *
+                    (1 - homog.omega.value.array() * input.expsec.array()) /
                     (input.average_secant.array() + homog.k.value.array());
 
-            particular.C_plus.d_b1.array() =
-                input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                    (homog.omega.d_b1.array()) /
-                    (input.average_secant.array() - homog.k.value.array()) +
-                homog.k.d_b1.array() * particular.C_plus.value.array() /
+                particular.C_plus.d_ssa.array() =
+                    input.transmission(
+                             Eigen::seq(0, Eigen::placeholders::last - 1))
+                            .array() *
+                        (homog.omega.d_ssa.array()) /
+                        (input.average_secant.array() - homog.k.value.array()) +
+                    homog.k.d_ssa.array() * particular.C_plus.value.array() /
+                        (input.average_secant.array() - homog.k.value.array());
+
+                particular.C_minus.d_ssa.array() =
+                    input.transmission(
+                             Eigen::seq(0, Eigen::placeholders::last - 1))
+                            .array() *
+                        (-homog.omega.d_ssa.array() * input.expsec.array()) /
+                        (input.average_secant.array() + homog.k.value.array()) -
+                    homog.k.d_ssa.array() * particular.C_minus.value.array() /
+                        (input.average_secant.array() + homog.k.value.array());
+
+                particular.C_plus.d_b1.array() =
+                    input.transmission(
+                             Eigen::seq(0, Eigen::placeholders::last - 1))
+                            .array() *
+                        (homog.omega.d_b1.array()) /
+                        (input.average_secant.array() - homog.k.value.array()) +
+                    homog.k.d_b1.array() * particular.C_plus.value.array() /
+                        (input.average_secant.array() - homog.k.value.array());
+
+                particular.C_minus.d_b1.array() =
+                    input.transmission(
+                             Eigen::seq(0, Eigen::placeholders::last - 1))
+                            .array() *
+                        (-homog.omega.d_b1.array() * input.expsec.array()) /
+                        (input.average_secant.array() + homog.k.value.array()) -
+                    homog.k.d_b1.array() * particular.C_minus.value.array() /
+                        (input.average_secant.array() + homog.k.value.array());
+
+                // OD Derivatives through omega and expsec.  expsec.d_od =
+                // -secant * expsec
+                particular.C_plus.d_od.array() =
+                    input
+                        .transmission(
+                            Eigen::seq(0, Eigen::placeholders::last - 1))
+                        .array() *
+                    (homog.omega.d_od.array() +
+                     input.average_secant.array() * input.expsec.array()) /
                     (input.average_secant.array() - homog.k.value.array());
 
-            particular.C_minus.d_b1.array() =
-                input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                    (-homog.omega.d_b1.array() * input.expsec.array()) /
-                    (input.average_secant.array() + homog.k.value.array()) -
-                homog.k.d_b1.array() * particular.C_minus.value.array() /
+                particular.C_minus.d_od.array() =
+                    input
+                        .transmission(
+                            Eigen::seq(0, Eigen::placeholders::last - 1))
+                        .array() *
+                    (-homog.omega.d_od.array() * input.expsec.array() +
+                     input.average_secant.array() * homog.omega.value.array() *
+                         input.expsec.array()) /
                     (input.average_secant.array() + homog.k.value.array());
 
-            // OD Derivatives through omega and expsec.  expsec.d_od = -secant *
-            // expsec
-            particular.C_plus.d_od.array() =
-                input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                (homog.omega.d_od.array() +
-                 input.average_secant.array() * input.expsec.array()) /
-                (input.average_secant.array() - homog.k.value.array());
+                // Transmission derivatives are straightfoward
+                particular.C_plus
+                    .d_transmission(
+                        Eigen::seq(0, Eigen::placeholders::last - 1))
+                    .array() =
+                    (homog.omega.value.array() - input.expsec.array()) /
+                    (input.average_secant.array() - homog.k.value.array());
 
-            particular.C_minus.d_od.array() =
-                input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                (-homog.omega.d_od.array() * input.expsec.array() +
-                 input.average_secant.array() * homog.omega.value.array() *
-                     input.expsec.array()) /
-                (input.average_secant.array() + homog.k.value.array());
+                particular.C_minus
+                    .d_transmission(
+                        Eigen::seq(0, Eigen::placeholders::last - 1))
+                    .array() =
+                    (1 - homog.omega.value.array() * input.expsec.array()) /
+                    (input.average_secant.array() + homog.k.value.array());
 
-            // Transmission derivatives are straightfoward
-            particular.C_plus.d_transmission(Eigen::seq(0, Eigen::last - 1))
-                .array() =
-                (homog.omega.value.array() - input.expsec.array()) /
-                (input.average_secant.array() - homog.k.value.array());
+                // Secant derivatives are a little more complicated
+                // expsec.d_sec = -od * expsec
+                particular.C_plus.d_secant.array() =
+                    (input.transmission(
+                              Eigen::seq(0, Eigen::placeholders::last - 1))
+                             .array() *
+                         input.od.array() * input.expsec.array() -
+                     particular.C_plus.value.array()) /
+                    (input.average_secant.array() - homog.k.value.array());
 
-            particular.C_minus.d_transmission(Eigen::seq(0, Eigen::last - 1))
-                .array() =
-                (1 - homog.omega.value.array() * input.expsec.array()) /
-                (input.average_secant.array() + homog.k.value.array());
+                particular.C_minus.d_secant.array() =
+                    (input.transmission(
+                              Eigen::seq(0, Eigen::placeholders::last - 1))
+                             .array() *
+                         input.od.array() * input.expsec.array() *
+                         homog.omega.value.array() -
+                     particular.C_minus.value.array()) /
+                    (input.average_secant.array() + homog.k.value.array());
+            }
 
-            // Secant derivatives are a little more complicated
-            // expsec.d_sec = -od * expsec
-            particular.C_plus.d_secant.array() =
-                (input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                     input.od.array() * input.expsec.array() -
-                 particular.C_plus.value.array()) /
-                (input.average_secant.array() - homog.k.value.array());
+            if constexpr (has_thermal<source_type>()) {
+                // Thermal Solution multipliers and their derivatives
+                particular.C_plus_thermal.value.array() =
+                    input.b0_thermal.array() *
+                    (homog.omega.value.array() - input.exp_thermal.array()) /
+                    (input.b1_thermal.array() - homog.k.value.array());
+                particular.C_minus_thermal.value.array() =
+                    input.b0_thermal.array() *
+                    (1 -
+                     homog.omega.value.array() * input.exp_thermal.array()) /
+                    (input.b1_thermal.array() + homog.k.value.array());
 
-            particular.C_minus.d_secant.array() =
-                (input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                     input.od.array() * input.expsec.array() *
-                     homog.omega.value.array() -
-                 particular.C_minus.value.array()) /
-                (input.average_secant.array() + homog.k.value.array());
+                particular.C_plus_thermal.d_ssa.array() =
+                    input.b0_thermal.array() * (homog.omega.d_ssa.array()) /
+                        (input.b1_thermal.array() - homog.k.value.array()) +
+                    homog.k.d_ssa.array() *
+                        particular.C_plus_thermal.value.array() /
+                        (input.b1_thermal.array() - homog.k.value.array());
 
-            // Particular solutions and their derivatives
-            particular.G_plus_top.value.array() =
-                particular.A_minus.value.array() *
-                particular.C_minus.value.array() * homog.X_minus.value.array();
-            particular.G_plus_bottom.value.array() =
-                particular.A_plus.value.array() *
-                particular.C_plus.value.array() * homog.X_plus.value.array();
-            particular.G_minus_top.value.array() =
-                particular.A_minus.value.array() *
-                particular.C_minus.value.array() * homog.X_plus.value.array();
-            particular.G_minus_bottom.value.array() =
-                particular.A_plus.value.array() *
-                particular.C_plus.value.array() * homog.X_minus.value.array();
+                particular.C_minus_thermal.d_ssa.array() =
+                    input.b0_thermal.array() *
+                        (-homog.omega.d_ssa.array() *
+                         input.exp_thermal.array()) /
+                        (input.b1_thermal.array() + homog.k.value.array()) -
+                    homog.k.d_ssa.array() *
+                        particular.C_minus_thermal.value.array() /
+                        (input.b1_thermal.array() + homog.k.value.array());
 
-            particular.G_plus_top.d_ssa.array() =
-                (particular.A_minus.d_ssa.array() *
-                     particular.C_minus.value.array() *
-                     homog.X_minus.value.array() +
-                 particular.A_minus.value.array() *
-                     particular.C_minus.d_ssa.array() *
-                     homog.X_minus.value.array() +
-                 particular.A_minus.value.array() *
-                     particular.C_minus.value.array() *
-                     homog.X_minus.d_ssa.array());
+                // OD Derivatives through omega and expsec.  exp_thermal.d_od =
+                // -b1 * exp_thermal
+                particular.C_plus_thermal.d_od.array() =
+                    input.b0_thermal.array() *
+                    (homog.omega.d_od.array() +
+                     input.b1_thermal.array() * input.exp_thermal.array()) /
+                    (input.b1_thermal.array() - homog.k.value.array());
 
-            particular.G_plus_bottom.d_ssa.array() =
-                (particular.A_plus.d_ssa.array() *
-                     particular.C_plus.value.array() *
-                     homog.X_plus.value.array() +
-                 particular.A_plus.value.array() *
-                     particular.C_plus.d_ssa.array() *
-                     homog.X_plus.value.array() +
-                 particular.A_plus.value.array() *
-                     particular.C_plus.value.array() *
-                     homog.X_plus.d_ssa.array());
+                particular.C_minus_thermal.d_od.array() =
+                    input.b0_thermal.array() *
+                    (-homog.omega.d_od.array() * input.exp_thermal.array() +
+                     input.b1_thermal.array() * homog.omega.value.array() *
+                         input.exp_thermal.array()) /
+                    (input.b1_thermal.array() + homog.k.value.array());
 
-            particular.G_minus_top.d_ssa.array() =
-                (particular.A_minus.d_ssa.array() *
-                     particular.C_minus.value.array() *
-                     homog.X_plus.value.array() +
-                 particular.A_minus.value.array() *
-                     particular.C_minus.d_ssa.array() *
-                     homog.X_plus.value.array() +
-                 particular.A_minus.value.array() *
-                     particular.C_minus.value.array() *
-                     homog.X_plus.d_ssa.array());
+                // thermal derivs
+                particular.C_plus_thermal.d_thermal_b0.array() =
+                    (homog.omega.value.array() - input.exp_thermal.array()) /
+                    (input.b1_thermal.array() - homog.k.value.array());
 
-            particular.G_minus_bottom.d_ssa.array() =
-                (particular.A_plus.d_ssa.array() *
-                     particular.C_plus.value.array() *
-                     homog.X_minus.value.array() +
-                 particular.A_plus.value.array() *
-                     particular.C_plus.d_ssa.array() *
-                     homog.X_minus.value.array() +
-                 particular.A_plus.value.array() *
-                     particular.C_plus.value.array() *
-                     homog.X_minus.d_ssa.array());
+                particular.C_minus_thermal.d_thermal_b0.array() =
+                    (1 -
+                     homog.omega.value.array() * input.exp_thermal.array()) /
+                    (input.b1_thermal.array() + homog.k.value.array());
 
-            // b1 derivatives
-            particular.G_plus_top.d_b1.array() =
-                (particular.A_minus.d_b1.array() *
-                     particular.C_minus.value.array() *
-                     homog.X_minus.value.array() +
-                 particular.A_minus.value.array() *
-                     particular.C_minus.d_b1.array() *
-                     homog.X_minus.value.array() +
-                 particular.A_minus.value.array() *
-                     particular.C_minus.value.array() *
-                     homog.X_minus.d_b1.array());
+                // b1 derivatives are a little more complicated
+                // exp_thermal.d_b1 = -od * exp_thermal
+                particular.C_plus_thermal.d_thermal_b1.array() =
+                    (input.b0_thermal.array() * input.od.array() *
+                         input.exp_thermal.array() -
+                     particular.C_plus_thermal.value.array()) /
+                    (input.b1_thermal.array() - homog.k.value.array());
 
-            particular.G_plus_bottom.d_b1.array() =
-                (particular.A_plus.d_b1.array() *
-                     particular.C_plus.value.array() *
-                     homog.X_plus.value.array() +
-                 particular.A_plus.value.array() *
-                     particular.C_plus.d_b1.array() *
-                     homog.X_plus.value.array() +
-                 particular.A_plus.value.array() *
-                     particular.C_plus.value.array() *
-                     homog.X_plus.d_b1.array());
+                particular.C_minus_thermal.d_thermal_b1.array() =
+                    (input.b0_thermal.array() * input.od.array() *
+                         input.exp_thermal.array() * homog.omega.value.array() -
+                     particular.C_minus_thermal.value.array()) /
+                    (input.b1_thermal.array() + homog.k.value.array());
+            }
 
-            particular.G_minus_top.d_b1.array() =
-                (particular.A_minus.d_b1.array() *
-                     particular.C_minus.value.array() *
-                     homog.X_plus.value.array() +
-                 particular.A_minus.value.array() *
-                     particular.C_minus.d_b1.array() *
-                     homog.X_plus.value.array() +
-                 particular.A_minus.value.array() *
-                     particular.C_minus.value.array() *
-                     homog.X_plus.d_b1.array());
+            if constexpr (has_solar<source_type>()) {
+                // Particular solutions and their derivatives
+                particular.G_plus_top.value.array() =
+                    particular.A_minus.value.array() *
+                    particular.C_minus.value.array() *
+                    homog.X_minus.value.array();
+                particular.G_plus_bottom.value.array() =
+                    particular.A_plus.value.array() *
+                    particular.C_plus.value.array() *
+                    homog.X_plus.value.array();
+                particular.G_minus_top.value.array() =
+                    particular.A_minus.value.array() *
+                    particular.C_minus.value.array() *
+                    homog.X_plus.value.array();
+                particular.G_minus_bottom.value.array() =
+                    particular.A_plus.value.array() *
+                    particular.C_plus.value.array() *
+                    homog.X_minus.value.array();
 
-            particular.G_minus_bottom.d_b1.array() =
-                (particular.A_plus.d_b1.array() *
-                     particular.C_plus.value.array() *
-                     homog.X_minus.value.array() +
-                 particular.A_plus.value.array() *
-                     particular.C_plus.d_b1.array() *
-                     homog.X_minus.value.array() +
-                 particular.A_plus.value.array() *
-                     particular.C_plus.value.array() *
-                     homog.X_minus.d_b1.array());
+                particular.G_plus_top.d_ssa.array() =
+                    (particular.A_minus.d_ssa.array() *
+                         particular.C_minus.value.array() *
+                         homog.X_minus.value.array() +
+                     particular.A_minus.value.array() *
+                         particular.C_minus.d_ssa.array() *
+                         homog.X_minus.value.array() +
+                     particular.A_minus.value.array() *
+                         particular.C_minus.value.array() *
+                         homog.X_minus.d_ssa.array());
 
-            // G's only take od, transmission, and secant derivatives from C's
-            particular.G_plus_top.d_od.array() =
-                particular.A_minus.value.array() *
-                particular.C_minus.d_od.array() * homog.X_minus.value.array();
+                particular.G_plus_bottom.d_ssa.array() =
+                    (particular.A_plus.d_ssa.array() *
+                         particular.C_plus.value.array() *
+                         homog.X_plus.value.array() +
+                     particular.A_plus.value.array() *
+                         particular.C_plus.d_ssa.array() *
+                         homog.X_plus.value.array() +
+                     particular.A_plus.value.array() *
+                         particular.C_plus.value.array() *
+                         homog.X_plus.d_ssa.array());
 
-            particular.G_plus_bottom.d_od.array() =
-                particular.A_plus.value.array() *
-                particular.C_plus.d_od.array() * homog.X_plus.value.array();
+                particular.G_minus_top.d_ssa.array() =
+                    (particular.A_minus.d_ssa.array() *
+                         particular.C_minus.value.array() *
+                         homog.X_plus.value.array() +
+                     particular.A_minus.value.array() *
+                         particular.C_minus.d_ssa.array() *
+                         homog.X_plus.value.array() +
+                     particular.A_minus.value.array() *
+                         particular.C_minus.value.array() *
+                         homog.X_plus.d_ssa.array());
 
-            particular.G_minus_top.d_od.array() =
-                particular.A_minus.value.array() *
-                particular.C_minus.d_od.array() * homog.X_plus.value.array();
+                particular.G_minus_bottom.d_ssa.array() =
+                    (particular.A_plus.d_ssa.array() *
+                         particular.C_plus.value.array() *
+                         homog.X_minus.value.array() +
+                     particular.A_plus.value.array() *
+                         particular.C_plus.d_ssa.array() *
+                         homog.X_minus.value.array() +
+                     particular.A_plus.value.array() *
+                         particular.C_plus.value.array() *
+                         homog.X_minus.d_ssa.array());
 
-            particular.G_minus_bottom.d_od.array() =
-                particular.A_plus.value.array() *
-                particular.C_plus.d_od.array() * homog.X_minus.value.array();
+                // b1 derivatives
+                particular.G_plus_top.d_b1.array() =
+                    (particular.A_minus.d_b1.array() *
+                         particular.C_minus.value.array() *
+                         homog.X_minus.value.array() +
+                     particular.A_minus.value.array() *
+                         particular.C_minus.d_b1.array() *
+                         homog.X_minus.value.array() +
+                     particular.A_minus.value.array() *
+                         particular.C_minus.value.array() *
+                         homog.X_minus.d_b1.array());
 
-            particular.G_plus_top.d_transmission(Eigen::seq(0, Eigen::last - 1))
-                .array() = particular.A_minus.value.array() *
-                           particular.C_minus
-                               .d_transmission(Eigen::seq(0, Eigen::last - 1))
-                               .array() *
-                           homog.X_minus.value.array();
+                particular.G_plus_bottom.d_b1.array() =
+                    (particular.A_plus.d_b1.array() *
+                         particular.C_plus.value.array() *
+                         homog.X_plus.value.array() +
+                     particular.A_plus.value.array() *
+                         particular.C_plus.d_b1.array() *
+                         homog.X_plus.value.array() +
+                     particular.A_plus.value.array() *
+                         particular.C_plus.value.array() *
+                         homog.X_plus.d_b1.array());
 
-            particular.G_plus_bottom
-                .d_transmission(Eigen::seq(0, Eigen::last - 1))
-                .array() =
-                particular.A_plus.value.array() *
-                particular.C_plus.d_transmission(Eigen::seq(0, Eigen::last - 1))
-                    .array() *
-                homog.X_plus.value.array();
+                particular.G_minus_top.d_b1.array() =
+                    (particular.A_minus.d_b1.array() *
+                         particular.C_minus.value.array() *
+                         homog.X_plus.value.array() +
+                     particular.A_minus.value.array() *
+                         particular.C_minus.d_b1.array() *
+                         homog.X_plus.value.array() +
+                     particular.A_minus.value.array() *
+                         particular.C_minus.value.array() *
+                         homog.X_plus.d_b1.array());
 
-            particular.G_minus_top
-                .d_transmission(Eigen::seq(0, Eigen::last - 1))
-                .array() = particular.A_minus.value.array() *
-                           particular.C_minus
-                               .d_transmission(Eigen::seq(0, Eigen::last - 1))
-                               .array() *
-                           homog.X_plus.value.array();
+                particular.G_minus_bottom.d_b1.array() =
+                    (particular.A_plus.d_b1.array() *
+                         particular.C_plus.value.array() *
+                         homog.X_minus.value.array() +
+                     particular.A_plus.value.array() *
+                         particular.C_plus.d_b1.array() *
+                         homog.X_minus.value.array() +
+                     particular.A_plus.value.array() *
+                         particular.C_plus.value.array() *
+                         homog.X_minus.d_b1.array());
 
-            particular.G_minus_bottom
-                .d_transmission(Eigen::seq(0, Eigen::last - 1))
-                .array() =
-                particular.A_plus.value.array() *
-                particular.C_plus.d_transmission(Eigen::seq(0, Eigen::last - 1))
-                    .array() *
-                homog.X_minus.value.array();
+                // G's only take od, transmission, and secant derivatives from
+                // C's
+                particular.G_plus_top.d_od.array() =
+                    particular.A_minus.value.array() *
+                    particular.C_minus.d_od.array() *
+                    homog.X_minus.value.array();
 
-            particular.G_plus_top.d_secant.array() =
-                particular.A_minus.value.array() *
-                particular.C_minus.d_secant.array() *
-                homog.X_minus.value.array();
+                particular.G_plus_bottom.d_od.array() =
+                    particular.A_plus.value.array() *
+                    particular.C_plus.d_od.array() * homog.X_plus.value.array();
 
-            particular.G_plus_bottom.d_secant.array() =
-                particular.A_plus.value.array() *
-                particular.C_plus.d_secant.array() * homog.X_plus.value.array();
+                particular.G_minus_top.d_od.array() =
+                    particular.A_minus.value.array() *
+                    particular.C_minus.d_od.array() *
+                    homog.X_plus.value.array();
 
-            particular.G_minus_top.d_secant.array() =
-                particular.A_minus.value.array() *
-                particular.C_minus.d_secant.array() *
-                homog.X_plus.value.array();
+                particular.G_minus_bottom.d_od.array() =
+                    particular.A_plus.value.array() *
+                    particular.C_plus.d_od.array() *
+                    homog.X_minus.value.array();
 
-            particular.G_minus_bottom.d_secant.array() =
-                particular.A_plus.value.array() *
-                particular.C_plus.d_secant.array() *
-                homog.X_minus.value.array();
+                particular.G_plus_top
+                    .d_transmission(
+                        Eigen::seq(0, Eigen::placeholders::last - 1))
+                    .array() = particular.A_minus.value.array() *
+                               particular.C_minus
+                                   .d_transmission(Eigen::seq(
+                                       0, Eigen::placeholders::last - 1))
+                                   .array() *
+                               homog.X_minus.value.array();
+
+                particular.G_plus_bottom
+                    .d_transmission(
+                        Eigen::seq(0, Eigen::placeholders::last - 1))
+                    .array() = particular.A_plus.value.array() *
+                               particular.C_plus
+                                   .d_transmission(Eigen::seq(
+                                       0, Eigen::placeholders::last - 1))
+                                   .array() *
+                               homog.X_plus.value.array();
+
+                particular.G_minus_top
+                    .d_transmission(
+                        Eigen::seq(0, Eigen::placeholders::last - 1))
+                    .array() = particular.A_minus.value.array() *
+                               particular.C_minus
+                                   .d_transmission(Eigen::seq(
+                                       0, Eigen::placeholders::last - 1))
+                                   .array() *
+                               homog.X_plus.value.array();
+
+                particular.G_minus_bottom
+                    .d_transmission(
+                        Eigen::seq(0, Eigen::placeholders::last - 1))
+                    .array() = particular.A_plus.value.array() *
+                               particular.C_plus
+                                   .d_transmission(Eigen::seq(
+                                       0, Eigen::placeholders::last - 1))
+                                   .array() *
+                               homog.X_minus.value.array();
+
+                particular.G_plus_top.d_secant.array() =
+                    particular.A_minus.value.array() *
+                    particular.C_minus.d_secant.array() *
+                    homog.X_minus.value.array();
+
+                particular.G_plus_bottom.d_secant.array() =
+                    particular.A_plus.value.array() *
+                    particular.C_plus.d_secant.array() *
+                    homog.X_plus.value.array();
+
+                particular.G_minus_top.d_secant.array() =
+                    particular.A_minus.value.array() *
+                    particular.C_minus.d_secant.array() *
+                    homog.X_plus.value.array();
+
+                particular.G_minus_bottom.d_secant.array() =
+                    particular.A_plus.value.array() *
+                    particular.C_plus.d_secant.array() *
+                    homog.X_minus.value.array();
+            }
+
+            if constexpr (source_type == SourceType::ONLY_THERMAL) {
+                // Particular solutions and their derivatives
+                particular.G_plus_top.value.array() =
+                    particular.A_thermal.value.array() *
+                    particular.C_minus_thermal.value.array() *
+                    homog.X_minus.value.array();
+                particular.G_plus_bottom.value.array() =
+                    particular.A_thermal.value.array() *
+                    particular.C_plus_thermal.value.array() *
+                    homog.X_plus.value.array();
+                particular.G_minus_top.value.array() =
+                    particular.A_thermal.value.array() *
+                    particular.C_minus_thermal.value.array() *
+                    homog.X_plus.value.array();
+                particular.G_minus_bottom.value.array() =
+                    particular.A_thermal.value.array() *
+                    particular.C_plus_thermal.value.array() *
+                    homog.X_minus.value.array();
+
+                particular.G_plus_top.d_ssa.array() =
+                    (particular.A_thermal.d_ssa.array() *
+                         particular.C_minus_thermal.value.array() *
+                         homog.X_minus.value.array() +
+                     particular.A_thermal.value.array() *
+                         particular.C_minus_thermal.d_ssa.array() *
+                         homog.X_minus.value.array() +
+                     particular.A_thermal.value.array() *
+                         particular.C_minus_thermal.value.array() *
+                         homog.X_minus.d_ssa.array());
+
+                particular.G_plus_bottom.d_ssa.array() =
+                    (particular.A_thermal.d_ssa.array() *
+                         particular.C_plus_thermal.value.array() *
+                         homog.X_plus.value.array() +
+                     particular.A_thermal.value.array() *
+                         particular.C_plus_thermal.d_ssa.array() *
+                         homog.X_plus.value.array() +
+                     particular.A_thermal.value.array() *
+                         particular.C_plus_thermal.value.array() *
+                         homog.X_plus.d_ssa.array());
+
+                particular.G_minus_top.d_ssa.array() =
+                    (particular.A_thermal.d_ssa.array() *
+                         particular.C_minus_thermal.value.array() *
+                         homog.X_plus.value.array() +
+                     particular.A_thermal.value.array() *
+                         particular.C_minus_thermal.d_ssa.array() *
+                         homog.X_plus.value.array() +
+                     particular.A_thermal.value.array() *
+                         particular.C_minus_thermal.value.array() *
+                         homog.X_plus.d_ssa.array());
+
+                particular.G_minus_bottom.d_ssa.array() =
+                    (particular.A_thermal.d_ssa.array() *
+                         particular.C_plus_thermal.value.array() *
+                         homog.X_minus.value.array() +
+                     particular.A_thermal.value.array() *
+                         particular.C_plus_thermal.d_ssa.array() *
+                         homog.X_minus.value.array() +
+                     particular.A_thermal.value.array() *
+                         particular.C_plus_thermal.value.array() *
+                         homog.X_minus.d_ssa.array());
+
+                // G's only take od, thermal_b0, and thermal_b1 from C's
+                particular.G_plus_top.d_od.array() =
+                    particular.A_thermal.value.array() *
+                    particular.C_minus_thermal.d_od.array() *
+                    homog.X_minus.value.array();
+
+                particular.G_plus_bottom.d_od.array() =
+                    particular.A_thermal.value.array() *
+                    particular.C_plus_thermal.d_od.array() *
+                    homog.X_plus.value.array();
+
+                particular.G_minus_top.d_od.array() =
+                    particular.A_thermal.value.array() *
+                    particular.C_minus_thermal.d_od.array() *
+                    homog.X_plus.value.array();
+
+                particular.G_minus_bottom.d_od.array() =
+                    particular.A_thermal.value.array() *
+                    particular.C_plus_thermal.d_od.array() *
+                    homog.X_minus.value.array();
+
+                particular.G_plus_top.d_thermal_b0.array() =
+                    particular.A_thermal.value.array() *
+                    particular.C_minus_thermal.d_thermal_b0.array() *
+                    homog.X_minus.value.array();
+
+                particular.G_plus_bottom.d_thermal_b0.array() =
+                    particular.A_thermal.value.array() *
+                    particular.C_plus_thermal.d_thermal_b0.array() *
+                    homog.X_plus.value.array();
+
+                particular.G_minus_top.d_thermal_b0.array() =
+                    particular.A_thermal.value.array() *
+                    particular.C_minus_thermal.d_thermal_b0.array() *
+                    homog.X_plus.value.array();
+
+                particular.G_minus_bottom.d_thermal_b0.array() =
+                    particular.A_thermal.value.array() *
+                    particular.C_plus_thermal.d_thermal_b0.array() *
+                    homog.X_minus.value.array();
+
+                particular.G_plus_top.d_thermal_b1.array() =
+                    particular.A_thermal.value.array() *
+                    particular.C_minus_thermal.d_thermal_b1.array() *
+                    homog.X_minus.value.array();
+
+                particular.G_plus_bottom.d_thermal_b1.array() =
+                    particular.A_thermal.value.array() *
+                    particular.C_plus_thermal.d_thermal_b1.array() *
+                    homog.X_plus.value.array();
+
+                particular.G_minus_top.d_thermal_b1.array() =
+                    particular.A_thermal.value.array() *
+                    particular.C_minus_thermal.d_thermal_b1.array() *
+                    homog.X_plus.value.array();
+
+                particular.G_minus_bottom.d_thermal_b1.array() =
+                    particular.A_thermal.value.array() *
+                    particular.C_plus_thermal.d_thermal_b1.array() *
+                    homog.X_minus.value.array();
+            }
         }
     }
 
@@ -567,29 +1082,46 @@ namespace sasktran2::twostream {
      * @param input
      * @param solution
      */
-    inline void solve_bvp(const Input& input, Solution& solution) {
+    template <SourceType source_type>
+    inline void solve_bvp(const Input<source_type>& input,
+                          Solution<source_type>& solution) {
+        ZoneScopedN("solve_bvp");
         // Solve the BVP
 
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < num_azimuth<source_type>(); ++i) {
             auto& homog = solution.homog[i];
             auto& particular = solution.particular[i];
             auto& bvp = solution.bvp_coeffs[i];
 
             bvp.rhs(0, 0) = -1.0 * particular.G_plus_top.value(0);
 
-            bvp.rhs(Eigen::seq(1, Eigen::last - 1, 2), 0) =
-                particular.G_minus_top.value(Eigen::seq(1, Eigen::last)) -
-                particular.G_minus_bottom.value(Eigen::seq(0, Eigen::last - 1));
-            bvp.rhs(Eigen::seq(2, Eigen::last, 2), 0) =
-                particular.G_plus_top.value(Eigen::seq(1, Eigen::last)) -
-                particular.G_plus_bottom.value(Eigen::seq(0, Eigen::last - 1));
+            bvp.rhs(Eigen::seq(1, Eigen::placeholders::last - 1, 2), 0) =
+                particular.G_minus_top.value(
+                    Eigen::seq(1, Eigen::placeholders::last)) -
+                particular.G_minus_bottom.value(
+                    Eigen::seq(0, Eigen::placeholders::last - 1));
+            bvp.rhs(Eigen::seq(2, Eigen::placeholders::last, 2), 0) =
+                particular.G_plus_top.value(
+                    Eigen::seq(1, Eigen::placeholders::last)) -
+                particular.G_plus_bottom.value(
+                    Eigen::seq(0, Eigen::placeholders::last - 1));
 
-            bvp.rhs(2 * input.nlyr - 1, 0) =
-                sasktran_disco::kronDelta(i, 0) * input.csz * input.albedo /
-                    EIGEN_PI * input.transmission(Eigen::last) -
-                (particular.G_minus_bottom.value(Eigen::last) -
-                 2 * sasktran_disco::kronDelta(i, 0) * input.mu * input.albedo *
-                     particular.G_plus_bottom.value(Eigen::last));
+            if constexpr (source_type == SourceType::ONLY_SOLAR) {
+                bvp.rhs(2 * input.nlyr - 1, 0) =
+                    sasktran_disco::kronDelta(i, 0) * input.csz * input.albedo /
+                        EIGEN_PI *
+                        input.transmission(Eigen::placeholders::last) -
+                    (particular.G_minus_bottom.value(
+                         Eigen::placeholders::last) -
+                     2 * sasktran_disco::kronDelta(i, 0) * input.mu *
+                         input.albedo *
+                         particular.G_plus_bottom.value(
+                             Eigen::placeholders::last));
+            }
+
+            if constexpr (source_type == SourceType::ONLY_THERMAL) {
+                bvp.rhs(2 * input.nlyr - 1, 0) = input.thermal_surf;
+            }
 
             // Now the LHS and gradients
             bvp.d(0) = homog.X_plus.value(0);
@@ -670,52 +1202,52 @@ namespace sasktran2::twostream {
             }
 
             bvp.c(2 * input.nlyr - 1) =
-                (homog.X_minus.value(Eigen::last) -
+                (homog.X_minus.value(Eigen::placeholders::last) -
                  2 * input.mu * input.albedo * sasktran_disco::kronDelta(i, 0) *
-                     homog.X_plus.value(Eigen::last)) *
-                homog.omega.value(Eigen::last);
+                     homog.X_plus.value(Eigen::placeholders::last)) *
+                homog.omega.value(Eigen::placeholders::last);
             bvp.d(2 * input.nlyr - 1) =
-                (homog.X_plus.value(Eigen::last) -
+                (homog.X_plus.value(Eigen::placeholders::last) -
                  2 * input.mu * input.albedo * sasktran_disco::kronDelta(i, 0) *
-                     homog.X_minus.value(Eigen::last));
+                     homog.X_minus.value(Eigen::placeholders::last));
 
             bvp.d_d_by_ssa(2 * input.nlyr - 1, input.nlyr - 1) =
-                homog.X_plus.d_ssa(Eigen::last) -
+                homog.X_plus.d_ssa(Eigen::placeholders::last) -
                 2 * input.mu * input.albedo * sasktran_disco::kronDelta(i, 0) *
-                    homog.X_minus.d_ssa(Eigen::last);
+                    homog.X_minus.d_ssa(Eigen::placeholders::last);
 
             bvp.d_c_by_ssa(2 * input.nlyr - 1, input.nlyr - 1) =
-                (homog.X_minus.d_ssa(Eigen::last) -
+                (homog.X_minus.d_ssa(Eigen::placeholders::last) -
                  2 * input.mu * input.albedo * sasktran_disco::kronDelta(i, 0) *
-                     homog.X_plus.d_ssa(Eigen::last)) *
-                    homog.omega.value(Eigen::last) +
-                (homog.X_minus.value(Eigen::last) -
+                     homog.X_plus.d_ssa(Eigen::placeholders::last)) *
+                    homog.omega.value(Eigen::placeholders::last) +
+                (homog.X_minus.value(Eigen::placeholders::last) -
                  2 * input.mu * input.albedo * sasktran_disco::kronDelta(i, 0) *
-                     homog.X_plus.value(Eigen::last)) *
-                    homog.omega.d_ssa(Eigen::last);
+                     homog.X_plus.value(Eigen::placeholders::last)) *
+                    homog.omega.d_ssa(Eigen::placeholders::last);
 
             bvp.d_d_by_b1(2 * input.nlyr - 1, input.nlyr - 1) =
-                homog.X_plus.d_b1(Eigen::last) -
+                homog.X_plus.d_b1(Eigen::placeholders::last) -
                 2 * input.mu * input.albedo * sasktran_disco::kronDelta(i, 0) *
-                    homog.X_minus.d_b1(Eigen::last);
+                    homog.X_minus.d_b1(Eigen::placeholders::last);
 
             bvp.d_c_by_b1(2 * input.nlyr - 1, input.nlyr - 1) =
-                (homog.X_minus.d_b1(Eigen::last) -
+                (homog.X_minus.d_b1(Eigen::placeholders::last) -
                  2 * input.mu * input.albedo * sasktran_disco::kronDelta(i, 0) *
-                     homog.X_plus.d_b1(Eigen::last)) *
-                    homog.omega.value(Eigen::last) +
-                (homog.X_minus.value(Eigen::last) -
+                     homog.X_plus.d_b1(Eigen::placeholders::last)) *
+                    homog.omega.value(Eigen::placeholders::last) +
+                (homog.X_minus.value(Eigen::placeholders::last) -
                  2 * input.mu * input.albedo * sasktran_disco::kronDelta(i, 0) *
-                     homog.X_plus.value(Eigen::last)) *
-                    homog.omega.d_b1(Eigen::last);
+                     homog.X_plus.value(Eigen::placeholders::last)) *
+                    homog.omega.d_b1(Eigen::placeholders::last);
 
             bvp.d_c_by_od(2 * input.nlyr - 1, input.nlyr - 1) =
-                (homog.X_minus.value(Eigen::last) -
+                (homog.X_minus.value(Eigen::placeholders::last) -
                  2 * input.mu * input.albedo * sasktran_disco::kronDelta(i, 0) *
-                     homog.X_plus.value(Eigen::last)) *
-                homog.omega.d_od(Eigen::last);
+                     homog.X_plus.value(Eigen::placeholders::last)) *
+                homog.omega.d_od(Eigen::placeholders::last);
 
-            pentadiagonal_solve(bvp, bvp.rhs);
+            pentadiagonal_solve<source_type, false>(bvp, bvp.rhs);
         }
     }
 
@@ -725,7 +1257,9 @@ namespace sasktran2::twostream {
      * @param input
      * @param solution
      */
-    inline void solve(const Input& input, Solution& solution) {
+    template <SourceType source_type>
+    inline void solve(const Input<source_type>& input,
+                      Solution<source_type>& solution) {
         // Assign the homogneous and particular solutions
         solve_layers(input, solution);
 
@@ -743,86 +1277,121 @@ namespace sasktran2::twostream {
      * @param solution
      * @param sources
      */
-    inline void post_process(const Input& input, double viewing_zenith,
-                             double azimuth, const Solution& solution,
-                             Sources& sources) {
-        // Lpsums
-        sources.lpsum_plus[0].value.array() =
-            0.5 * (input.ssa.array() - input.ssa.array() * input.b1.array() *
-                                           viewing_zenith * input.mu);
-        sources.lpsum_minus[0].value.array() =
-            0.5 * (input.ssa.array() + input.ssa.array() * input.b1.array() *
-                                           viewing_zenith * input.mu);
+    template <SourceType source_type>
+    inline void post_process(const Input<source_type>& input,
+                             double viewing_zenith, double azimuth,
+                             const Solution<source_type>& solution,
+                             Sources<source_type>& sources) {
+        ZoneScopedN("twostream post process");
 
-        sources.lpsum_plus[1].value.array() =
-            0.25 * input.ssa.array() * input.b1.array() *
-            sqrt((1 - viewing_zenith * viewing_zenith) *
-                 (1 - input.mu * input.mu));
-        sources.lpsum_minus[1].value.array() =
-            0.25 * input.ssa.array() * input.b1.array() *
-            sqrt((1 - viewing_zenith * viewing_zenith) *
-                 (1 - input.mu * input.mu));
-
-        // And their derivatives
-        sources.lpsum_plus[0].d_ssa.array() =
-            0.5 * (1 - input.b1.array() * viewing_zenith * input.mu);
-        sources.lpsum_minus[0].d_ssa.array() =
-            0.5 * (1 + input.b1.array() * viewing_zenith * input.mu);
-
-        sources.lpsum_plus[1].d_ssa.array() =
-            0.25 * input.b1.array() *
-            sqrt((1 - viewing_zenith * viewing_zenith) *
-                 (1 - input.mu * input.mu));
-        sources.lpsum_minus[1].d_ssa.array() =
-            0.25 * input.b1.array() *
-            sqrt((1 - viewing_zenith * viewing_zenith) *
-                 (1 - input.mu * input.mu));
-
-        sources.lpsum_plus[0].d_b1.array() =
-            -0.5 * input.ssa.array() * viewing_zenith * input.mu;
-
-        sources.lpsum_minus[0].d_b1.array() =
-            0.5 * input.ssa.array() * viewing_zenith * input.mu;
-
-        sources.lpsum_plus[1].d_b1.array() =
-            0.25 * input.ssa.array() *
-            sqrt((1 - viewing_zenith * viewing_zenith) *
-                 (1 - input.mu * input.mu));
-
-        sources.lpsum_minus[1].d_b1.array() =
-            0.25 * input.ssa.array() *
-            sqrt((1 - viewing_zenith * viewing_zenith) *
-                 (1 - input.mu * input.mu));
-
+        // Must be computed before any source terms that depend on LOS
+        // attenuation (e.g., E_minus/E_thermal) to avoid using stale values
+        // across repeated engine calls.
         sources.beamtrans.value.array() =
             (-input.od.array() / viewing_zenith).exp();
 
         sources.beamtrans.d_od.array() =
             -sources.beamtrans.value.array() / viewing_zenith;
 
-        sources.E_minus.value.array() =
-            (1 - input.expsec.array() * sources.beamtrans.value.array()) /
-            (1 + input.average_secant.array() * viewing_zenith);
+        if constexpr (has_solar<source_type>()) {
+            // Lpsums
+            sources.lpsum_plus[0].value.array() =
+                0.5 *
+                (input.ssa.array() - input.ssa.array() * input.b1.array() *
+                                         viewing_zenith * input.mu);
+            sources.lpsum_minus[0].value.array() =
+                0.5 *
+                (input.ssa.array() + input.ssa.array() * input.b1.array() *
+                                         viewing_zenith * input.mu);
 
-        sources.E_minus.d_od.array() =
-            (input.average_secant.array() * input.expsec.array() *
-                 sources.beamtrans.value.array() -
-             input.expsec.array() * sources.beamtrans.d_od.array()) /
-            (1 + input.average_secant.array() * viewing_zenith);
+            sources.lpsum_plus[1].value.array() =
+                0.25 * input.ssa.array() * input.b1.array() *
+                sqrt((1 - viewing_zenith * viewing_zenith) *
+                     (1 - input.mu * input.mu));
+            sources.lpsum_minus[1].value.array() =
+                0.25 * input.ssa.array() * input.b1.array() *
+                sqrt((1 - viewing_zenith * viewing_zenith) *
+                     (1 - input.mu * input.mu));
 
-        sources.E_minus.d_secant.array() =
-            (input.od.array() * input.expsec.array() *
-                 sources.beamtrans.value.array() -
-             viewing_zenith * sources.E_minus.value.array()) /
-            (1 + input.average_secant.array() * viewing_zenith);
+            // And their derivatives
+            sources.lpsum_plus[0].d_ssa.array() =
+                0.5 * (1 - input.b1.array() * viewing_zenith * input.mu);
+            sources.lpsum_minus[0].d_ssa.array() =
+                0.5 * (1 + input.b1.array() * viewing_zenith * input.mu);
+
+            sources.lpsum_plus[1].d_ssa.array() =
+                0.25 * input.b1.array() *
+                sqrt((1 - viewing_zenith * viewing_zenith) *
+                     (1 - input.mu * input.mu));
+            sources.lpsum_minus[1].d_ssa.array() =
+                0.25 * input.b1.array() *
+                sqrt((1 - viewing_zenith * viewing_zenith) *
+                     (1 - input.mu * input.mu));
+
+            sources.lpsum_plus[0].d_b1.array() =
+                -0.5 * input.ssa.array() * viewing_zenith * input.mu;
+
+            sources.lpsum_minus[0].d_b1.array() =
+                0.5 * input.ssa.array() * viewing_zenith * input.mu;
+
+            sources.lpsum_plus[1].d_b1.array() =
+                0.25 * input.ssa.array() *
+                sqrt((1 - viewing_zenith * viewing_zenith) *
+                     (1 - input.mu * input.mu));
+
+            sources.lpsum_minus[1].d_b1.array() =
+                0.25 * input.ssa.array() *
+                sqrt((1 - viewing_zenith * viewing_zenith) *
+                     (1 - input.mu * input.mu));
+
+            sources.E_minus.value.array() =
+                (1 - input.expsec.array() * sources.beamtrans.value.array()) /
+                (1 + input.average_secant.array() * viewing_zenith);
+
+            sources.E_minus.d_od.array() =
+                (input.average_secant.array() * input.expsec.array() *
+                     sources.beamtrans.value.array() -
+                 input.expsec.array() * sources.beamtrans.d_od.array()) /
+                (1 + input.average_secant.array() * viewing_zenith);
+
+            sources.E_minus.d_secant.array() =
+                (input.od.array() * input.expsec.array() *
+                     sources.beamtrans.value.array() -
+                 viewing_zenith * sources.E_minus.value.array()) /
+                (1 + input.average_secant.array() * viewing_zenith);
+
+            sources.source.d_transmission.array().setZero();
+            sources.source.d_secant.array().setZero();
+        }
 
         sources.source.value.array().setZero();
         sources.source.d_ssa.array().setZero();
         sources.source.d_od.array().setZero();
         sources.source.d_b1.array().setZero();
-        sources.source.d_transmission.array().setZero();
-        sources.source.d_secant.array().setZero();
-        for (int i = 0; i < 2; ++i) {
+
+        if constexpr (has_thermal<source_type>()) {
+            sources.source.d_thermal_b0.array().setZero();
+            sources.source.d_thermal_b1.array().setZero();
+
+            sources.E_thermal.value.array() =
+                (1 -
+                 input.exp_thermal.array() * sources.beamtrans.value.array()) /
+                (1 + input.b1_thermal.array() * viewing_zenith);
+
+            sources.E_thermal.d_od.array() =
+                (input.b1_thermal.array() * input.exp_thermal.array() *
+                     sources.beamtrans.value.array() -
+                 input.exp_thermal.array() * sources.beamtrans.d_od.array()) /
+                (1 + input.b1_thermal.array() * viewing_zenith);
+
+            sources.E_thermal.d_thermal_b1.array() =
+                (input.od.array() * input.exp_thermal.array() *
+                     sources.beamtrans.value.array() -
+                 viewing_zenith * sources.E_thermal.value.array()) /
+                (1 + input.b1_thermal.array() * viewing_zenith);
+        }
+
+        for (int i = 0; i < num_azimuth<source_type>(); ++i) {
             double azi_factor = cos(i * azimuth);
             const auto& homog = solution.homog[i];
             const auto& part = solution.particular[i];
@@ -929,216 +1498,440 @@ namespace sasktran2::twostream {
                  homog.omega.value.array() * sources.beamtrans.d_od.array()) /
                 (1 + homog.k.value.array() * viewing_zenith);
 
-            // Particular multipliers
-            sources.D_plus[i].value.array() =
-                input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                (sources.E_minus.value.array() -
-                 input.expsec.array() * sources.H_minus[i].value.array()) /
-                (input.average_secant.array() + homog.k.value.array());
-            sources.D_minus[i].value.array() =
-                input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                (sources.H_plus[i].value.array() -
-                 sources.E_minus.value.array()) /
-                (input.average_secant.array() - homog.k.value.array());
+            if constexpr (has_solar<source_type>()) {
 
-            // And their gradients with ssa
-            sources.D_plus[i].d_ssa.array() =
-                (input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                     (-sources.H_minus[i].d_ssa.array() *
-                      input.expsec.array()) -
-                 homog.k.d_ssa.array() * sources.D_plus[i].value.array()) /
-                (input.average_secant.array() + homog.k.value.array());
+                // Particular multipliers
+                sources.D_plus[i].value.array() =
+                    input
+                        .transmission(
+                            Eigen::seq(0, Eigen::placeholders::last - 1))
+                        .array() *
+                    (sources.E_minus.value.array() -
+                     input.expsec.array() * sources.H_minus[i].value.array()) /
+                    (input.average_secant.array() + homog.k.value.array());
+                sources.D_minus[i].value.array() =
+                    input
+                        .transmission(
+                            Eigen::seq(0, Eigen::placeholders::last - 1))
+                        .array() *
+                    (sources.H_plus[i].value.array() -
+                     sources.E_minus.value.array()) /
+                    (input.average_secant.array() - homog.k.value.array());
 
-            sources.D_minus[i].d_ssa.array() =
-                (input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                     sources.H_plus[i].d_ssa.array() +
-                 homog.k.d_ssa.array() * sources.D_minus[i].value.array()) /
-                (input.average_secant.array() - homog.k.value.array());
+                // And their gradients with ssa
+                sources.D_plus[i].d_ssa.array() =
+                    (input.transmission(
+                              Eigen::seq(0, Eigen::placeholders::last - 1))
+                             .array() *
+                         (-sources.H_minus[i].d_ssa.array() *
+                          input.expsec.array()) -
+                     homog.k.d_ssa.array() * sources.D_plus[i].value.array()) /
+                    (input.average_secant.array() + homog.k.value.array());
 
-            // and b1
-            sources.D_plus[i].d_b1.array() =
-                (input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                     (-sources.H_minus[i].d_b1.array() * input.expsec.array()) -
-                 homog.k.d_b1.array() * sources.D_plus[i].value.array()) /
-                (input.average_secant.array() + homog.k.value.array());
+                sources.D_minus[i].d_ssa.array() =
+                    (input.transmission(
+                              Eigen::seq(0, Eigen::placeholders::last - 1))
+                             .array() *
+                         sources.H_plus[i].d_ssa.array() +
+                     homog.k.d_ssa.array() * sources.D_minus[i].value.array()) /
+                    (input.average_secant.array() - homog.k.value.array());
 
-            sources.D_minus[i].d_b1.array() =
-                (input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                     sources.H_plus[i].d_b1.array() +
-                 homog.k.d_b1.array() * sources.D_minus[i].value.array()) /
-                (input.average_secant.array() - homog.k.value.array());
+                // and b1
+                sources.D_plus[i].d_b1.array() =
+                    (input.transmission(
+                              Eigen::seq(0, Eigen::placeholders::last - 1))
+                             .array() *
+                         (-sources.H_minus[i].d_b1.array() *
+                          input.expsec.array()) -
+                     homog.k.d_b1.array() * sources.D_plus[i].value.array()) /
+                    (input.average_secant.array() + homog.k.value.array());
 
-            // D's also have od derivatives through E_minus, expsec, and H
-            sources.D_plus[i].d_od.array() =
-                input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                (sources.E_minus.d_od.array() -
-                 input.expsec.array() * sources.H_minus[i].d_od.array() +
-                 input.average_secant.array() * input.expsec.array() *
-                     sources.H_minus[i].value.array()) /
-                (input.average_secant.array() + homog.k.value.array());
+                sources.D_minus[i].d_b1.array() =
+                    (input.transmission(
+                              Eigen::seq(0, Eigen::placeholders::last - 1))
+                             .array() *
+                         sources.H_plus[i].d_b1.array() +
+                     homog.k.d_b1.array() * sources.D_minus[i].value.array()) /
+                    (input.average_secant.array() - homog.k.value.array());
 
-            sources.D_minus[i].d_od.array() =
-                input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                (sources.H_plus[i].d_od.array() -
-                 sources.E_minus.d_od.array()) /
-                (input.average_secant.array() - homog.k.value.array());
+                // D's also have od derivatives through E_minus, expsec, and H
+                sources.D_plus[i].d_od.array() =
+                    input
+                        .transmission(
+                            Eigen::seq(0, Eigen::placeholders::last - 1))
+                        .array() *
+                    (sources.E_minus.d_od.array() -
+                     input.expsec.array() * sources.H_minus[i].d_od.array() +
+                     input.average_secant.array() * input.expsec.array() *
+                         sources.H_minus[i].value.array()) /
+                    (input.average_secant.array() + homog.k.value.array());
 
-            // Then we have straightforward transmission derivatives
-            sources.D_plus[i].d_transmission(Eigen::seq(0, Eigen::last - 1)) =
-                (sources.E_minus.value.array() -
-                 input.expsec.array() * sources.H_minus[i].value.array()) /
-                (input.average_secant.array() + homog.k.value.array());
+                sources.D_minus[i].d_od.array() =
+                    input
+                        .transmission(
+                            Eigen::seq(0, Eigen::placeholders::last - 1))
+                        .array() *
+                    (sources.H_plus[i].d_od.array() -
+                     sources.E_minus.d_od.array()) /
+                    (input.average_secant.array() - homog.k.value.array());
 
-            sources.D_minus[i].d_transmission(Eigen::seq(0, Eigen::last - 1)) =
-                (sources.H_plus[i].value.array() -
-                 sources.E_minus.value.array()) /
-                (input.average_secant.array() - homog.k.value.array());
+                // Then we have straightforward transmission derivatives
+                sources.D_plus[i].d_transmission(
+                    Eigen::seq(0, Eigen::placeholders::last - 1)) =
+                    (sources.E_minus.value.array() -
+                     input.expsec.array() * sources.H_minus[i].value.array()) /
+                    (input.average_secant.array() + homog.k.value.array());
 
-            // And more annoying secant derivatives
-            // E and expsec have secant derivatives
-            sources.D_plus[i].d_secant.array() =
-                (input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                     (sources.E_minus.d_secant.array() +
-                      input.od.array() * input.expsec.array() *
-                          sources.H_minus[i].value.array()) -
-                 sources.D_plus[i].value.array()) /
-                (input.average_secant.array() + homog.k.value.array());
+                sources.D_minus[i].d_transmission(
+                    Eigen::seq(0, Eigen::placeholders::last - 1)) =
+                    (sources.H_plus[i].value.array() -
+                     sources.E_minus.value.array()) /
+                    (input.average_secant.array() - homog.k.value.array());
 
-            sources.D_minus[i].d_secant.array() =
-                (input.transmission(Eigen::seq(0, Eigen::last - 1)).array() *
-                     (-sources.E_minus.d_secant.array()) -
-                 sources.D_minus[i].value.array()) /
-                (input.average_secant.array() - homog.k.value.array());
+                // And more annoying secant derivatives
+                // E and expsec have secant derivatives
+                sources.D_plus[i].d_secant.array() =
+                    (input.transmission(
+                              Eigen::seq(0, Eigen::placeholders::last - 1))
+                             .array() *
+                         (sources.E_minus.d_secant.array() +
+                          input.od.array() * input.expsec.array() *
+                              sources.H_minus[i].value.array()) -
+                     sources.D_plus[i].value.array()) /
+                    (input.average_secant.array() + homog.k.value.array());
 
-            // The particular source itself
-            sources.V[i].value.array() =
-                part.A_plus.value.array() * sources.Y_plus[i].value.array() *
-                    sources.D_minus[i].value.array() +
-                part.A_minus.value.array() * sources.Y_minus[i].value.array() *
-                    sources.D_plus[i].value.array();
+                sources.D_minus[i].d_secant.array() =
+                    (input.transmission(
+                              Eigen::seq(0, Eigen::placeholders::last - 1))
+                             .array() *
+                         (-sources.E_minus.d_secant.array()) -
+                     sources.D_minus[i].value.array()) /
+                    (input.average_secant.array() - homog.k.value.array());
+            }
 
-            // with it's derivative
-            sources.V[i].d_ssa.array() =
-                (part.A_plus.d_ssa.array() * sources.Y_plus[i].value.array() *
-                     sources.D_minus[i].value.array() +
-                 part.A_plus.value.array() * sources.Y_plus[i].d_ssa.array() *
-                     sources.D_minus[i].value.array() +
-                 part.A_plus.value.array() * sources.Y_plus[i].value.array() *
-                     sources.D_minus[i].d_ssa.array()) +
-                (part.A_minus.d_ssa.array() * sources.Y_minus[i].value.array() *
-                     sources.D_plus[i].value.array() +
-                 part.A_minus.value.array() * sources.Y_minus[i].d_ssa.array() *
-                     sources.D_plus[i].value.array() +
-                 part.A_minus.value.array() * sources.Y_minus[i].value.array() *
-                     sources.D_plus[i].d_ssa.array());
+            if constexpr (has_thermal<source_type>()) {
+                // Particular thermal multipliers
+                sources.D_plus_thermal[i].value.array() =
+                    input.b0_thermal.array() *
+                    (sources.E_thermal.value.array() -
+                     input.exp_thermal.array() *
+                         sources.H_minus[i].value.array()) /
+                    (input.b1_thermal.array() + homog.k.value.array());
+                sources.D_minus_thermal[i].value.array() =
+                    input.b0_thermal.array() *
+                    (sources.H_plus[i].value.array() -
+                     sources.E_thermal.value.array()) /
+                    (input.b1_thermal.array() - homog.k.value.array());
 
-            sources.V[i].d_b1.array() =
-                (part.A_plus.d_b1.array() * sources.Y_plus[i].value.array() *
-                     sources.D_minus[i].value.array() +
-                 part.A_plus.value.array() * sources.Y_plus[i].d_b1.array() *
-                     sources.D_minus[i].value.array() +
-                 part.A_plus.value.array() * sources.Y_plus[i].value.array() *
-                     sources.D_minus[i].d_b1.array()) +
-                (part.A_minus.d_b1.array() * sources.Y_minus[i].value.array() *
-                     sources.D_plus[i].value.array() +
-                 part.A_minus.value.array() * sources.Y_minus[i].d_b1.array() *
-                     sources.D_plus[i].value.array() +
-                 part.A_minus.value.array() * sources.Y_minus[i].value.array() *
-                     sources.D_plus[i].d_b1.array());
+                // And their gradients with ssa
+                sources.D_plus_thermal[i].d_ssa.array() =
+                    (input.b0_thermal.array() *
+                         (-sources.H_minus[i].d_ssa.array() *
+                          input.exp_thermal.array()) -
+                     homog.k.d_ssa.array() *
+                         sources.D_plus_thermal[i].value.array()) /
+                    (input.b1_thermal.array() + homog.k.value.array());
 
-            // D Has extra derivatives wrt to od, transmission, and secant
-            sources.V[i].d_od.array() =
-                (part.A_plus.value.array() * sources.Y_plus[i].value.array() *
-                     sources.D_minus[i].d_od.array() +
-                 part.A_minus.value.array() * sources.Y_minus[i].value.array() *
-                     sources.D_plus[i].d_od.array());
+                sources.D_minus_thermal[i].d_ssa.array() =
+                    (input.b0_thermal.array() *
+                         sources.H_plus[i].d_ssa.array() +
+                     homog.k.d_ssa.array() *
+                         sources.D_minus_thermal[i].value.array()) /
+                    (input.b1_thermal.array() - homog.k.value.array());
 
-            sources.V[i]
-                .d_transmission(Eigen::seq(0, Eigen::last - 1))
-                .array() =
-                (part.A_plus.value.array() * sources.Y_plus[i].value.array() *
-                     sources.D_minus[i]
-                         .d_transmission(Eigen::seq(0, Eigen::last - 1))
-                         .array() +
-                 part.A_minus.value.array() * sources.Y_minus[i].value.array() *
-                     sources.D_plus[i]
-                         .d_transmission(Eigen::seq(0, Eigen::last - 1))
-                         .array());
+                // and b1
+                sources.D_plus_thermal[i].d_b1.array() =
+                    (input.b0_thermal.array() *
+                         (-sources.H_minus[i].d_b1.array() *
+                          input.exp_thermal.array()) -
+                     homog.k.d_b1.array() *
+                         sources.D_plus_thermal[i].value.array()) /
+                    (input.b1_thermal.array() + homog.k.value.array());
 
-            sources.V[i].d_secant.array() =
-                (part.A_plus.value.array() * sources.Y_plus[i].value.array() *
-                     sources.D_minus[i].d_secant.array() +
-                 part.A_minus.value.array() * sources.Y_minus[i].value.array() *
-                     sources.D_plus[i].d_secant.array());
+                sources.D_minus_thermal[i].d_b1.array() =
+                    (input.b0_thermal.array() * sources.H_plus[i].d_b1.array() +
+                     homog.k.d_b1.array() *
+                         sources.D_minus_thermal[i].value.array()) /
+                    (input.b1_thermal.array() - homog.k.value.array());
+
+                // D's also have od derivatives through E_minus, expsec, and H
+                sources.D_plus_thermal[i].d_od.array() =
+                    input.b0_thermal.array() *
+                    (sources.E_thermal.d_od.array() -
+                     input.exp_thermal.array() *
+                         sources.H_minus[i].d_od.array() +
+                     input.b1_thermal.array() * input.exp_thermal.array() *
+                         sources.H_minus[i].value.array()) /
+                    (input.b1_thermal.array() + homog.k.value.array());
+
+                sources.D_minus_thermal[i].d_od.array() =
+                    input.b0_thermal.array() *
+                    (sources.H_plus[i].d_od.array() -
+                     sources.E_thermal.d_od.array()) /
+                    (input.b1_thermal.array() - homog.k.value.array());
+
+                // Then we have straightforward b0 derivs
+                sources.D_plus_thermal[i].d_thermal_b0 =
+                    (sources.E_thermal.value.array() -
+                     input.exp_thermal.array() *
+                         sources.H_minus[i].value.array()) /
+                    (input.b1_thermal.array() + homog.k.value.array());
+
+                sources.D_minus_thermal[i].d_thermal_b0 =
+                    (sources.H_plus[i].value.array() -
+                     sources.E_thermal.value.array()) /
+                    (input.b1_thermal.array() - homog.k.value.array());
+
+                // And more annoying b1 derivatives
+                // E and expsec have b1 derivatives
+                sources.D_plus_thermal[i].d_thermal_b1.array() =
+                    (input.b0_thermal.array() *
+                         (sources.E_thermal.d_thermal_b1.array() +
+                          input.od.array() * input.exp_thermal.array() *
+                              sources.H_minus[i].value.array()) -
+                     sources.D_plus_thermal[i].value.array()) /
+                    (input.b1_thermal.array() + homog.k.value.array());
+
+                sources.D_minus_thermal[i].d_thermal_b1.array() =
+                    (input.b0_thermal.array() *
+                         (-sources.E_thermal.d_thermal_b1.array()) -
+                     sources.D_minus_thermal[i].value.array()) /
+                    (input.b1_thermal.array() - homog.k.value.array());
+            }
+
+            if constexpr (source_type == SourceType::ONLY_SOLAR) {
+                // The particular source itself
+                sources.V[i].value.array() =
+                    part.A_plus.value.array() *
+                        sources.Y_plus[i].value.array() *
+                        sources.D_minus[i].value.array() +
+                    part.A_minus.value.array() *
+                        sources.Y_minus[i].value.array() *
+                        sources.D_plus[i].value.array();
+
+                // with it's derivative
+                sources.V[i].d_ssa.array() =
+                    (part.A_plus.d_ssa.array() *
+                         sources.Y_plus[i].value.array() *
+                         sources.D_minus[i].value.array() +
+                     part.A_plus.value.array() *
+                         sources.Y_plus[i].d_ssa.array() *
+                         sources.D_minus[i].value.array() +
+                     part.A_plus.value.array() *
+                         sources.Y_plus[i].value.array() *
+                         sources.D_minus[i].d_ssa.array()) +
+                    (part.A_minus.d_ssa.array() *
+                         sources.Y_minus[i].value.array() *
+                         sources.D_plus[i].value.array() +
+                     part.A_minus.value.array() *
+                         sources.Y_minus[i].d_ssa.array() *
+                         sources.D_plus[i].value.array() +
+                     part.A_minus.value.array() *
+                         sources.Y_minus[i].value.array() *
+                         sources.D_plus[i].d_ssa.array());
+
+                sources.V[i].d_b1.array() =
+                    (part.A_plus.d_b1.array() *
+                         sources.Y_plus[i].value.array() *
+                         sources.D_minus[i].value.array() +
+                     part.A_plus.value.array() *
+                         sources.Y_plus[i].d_b1.array() *
+                         sources.D_minus[i].value.array() +
+                     part.A_plus.value.array() *
+                         sources.Y_plus[i].value.array() *
+                         sources.D_minus[i].d_b1.array()) +
+                    (part.A_minus.d_b1.array() *
+                         sources.Y_minus[i].value.array() *
+                         sources.D_plus[i].value.array() +
+                     part.A_minus.value.array() *
+                         sources.Y_minus[i].d_b1.array() *
+                         sources.D_plus[i].value.array() +
+                     part.A_minus.value.array() *
+                         sources.Y_minus[i].value.array() *
+                         sources.D_plus[i].d_b1.array());
+
+                // D Has extra derivatives wrt to od, transmission, and secant
+                sources.V[i].d_od.array() =
+                    (part.A_plus.value.array() *
+                         sources.Y_plus[i].value.array() *
+                         sources.D_minus[i].d_od.array() +
+                     part.A_minus.value.array() *
+                         sources.Y_minus[i].value.array() *
+                         sources.D_plus[i].d_od.array());
+
+                sources.V[i]
+                    .d_transmission(
+                        Eigen::seq(0, Eigen::placeholders::last - 1))
+                    .array() =
+                    (part.A_plus.value.array() *
+                         sources.Y_plus[i].value.array() *
+                         sources.D_minus[i]
+                             .d_transmission(
+                                 Eigen::seq(0, Eigen::placeholders::last - 1))
+                             .array() +
+                     part.A_minus.value.array() *
+                         sources.Y_minus[i].value.array() *
+                         sources.D_plus[i]
+                             .d_transmission(
+                                 Eigen::seq(0, Eigen::placeholders::last - 1))
+                             .array());
+
+                sources.V[i].d_secant.array() =
+                    (part.A_plus.value.array() *
+                         sources.Y_plus[i].value.array() *
+                         sources.D_minus[i].d_secant.array() +
+                     part.A_minus.value.array() *
+                         sources.Y_minus[i].value.array() *
+                         sources.D_plus[i].d_secant.array());
+            }
+
+            if constexpr (source_type == SourceType::ONLY_THERMAL) {
+                // The particular thermal source itself
+                sources.V[i].value.array() =
+                    part.A_thermal.value.array() *
+                        sources.Y_plus[i].value.array() *
+                        sources.D_minus_thermal[i].value.array() +
+                    part.A_thermal.value.array() *
+                        sources.Y_minus[i].value.array() *
+                        sources.D_plus_thermal[i].value.array();
+
+                // with it's derivative
+                sources.V[i].d_ssa.array() =
+                    (part.A_thermal.d_ssa.array() *
+                         sources.Y_plus[i].value.array() *
+                         sources.D_minus_thermal[i].value.array() +
+                     part.A_thermal.value.array() *
+                         sources.Y_plus[i].d_ssa.array() *
+                         sources.D_minus_thermal[i].value.array() +
+                     part.A_thermal.value.array() *
+                         sources.Y_plus[i].value.array() *
+                         sources.D_minus_thermal[i].d_ssa.array()) +
+                    (part.A_thermal.d_ssa.array() *
+                         sources.Y_minus[i].value.array() *
+                         sources.D_plus_thermal[i].value.array() +
+                     part.A_thermal.value.array() *
+                         sources.Y_minus[i].d_ssa.array() *
+                         sources.D_plus_thermal[i].value.array() +
+                     part.A_thermal.value.array() *
+                         sources.Y_minus[i].value.array() *
+                         sources.D_plus_thermal[i].d_ssa.array());
+
+                sources.V[i].d_b1.array() =
+                    (part.A_thermal.value.array() *
+                         sources.Y_plus[i].d_b1.array() *
+                         sources.D_minus_thermal[i].value.array() +
+                     part.A_thermal.value.array() *
+                         sources.Y_plus[i].value.array() *
+                         sources.D_minus_thermal[i].d_b1.array()) +
+                    (part.A_thermal.value.array() *
+                         sources.Y_minus[i].d_b1.array() *
+                         sources.D_plus_thermal[i].value.array() +
+                     part.A_thermal.value.array() *
+                         sources.Y_minus[i].value.array() *
+                         sources.D_plus_thermal[i].d_b1.array());
+
+                // D Has extra derivatives wrt to od, transmission, and secant
+                sources.V[i].d_od.array() =
+                    (part.A_thermal.value.array() *
+                         sources.Y_plus[i].value.array() *
+                         sources.D_minus_thermal[i].d_od.array() +
+                     part.A_thermal.value.array() *
+                         sources.Y_minus[i].value.array() *
+                         sources.D_plus_thermal[i].d_od.array());
+
+                sources.V[i].d_thermal_b0.array() =
+                    (part.A_thermal.value.array() *
+                         sources.Y_plus[i].value.array() *
+                         sources.D_minus_thermal[i].d_thermal_b0.array() +
+                     part.A_thermal.value.array() *
+                         sources.Y_minus[i].value.array() *
+                         sources.D_plus_thermal[i].d_thermal_b0.array());
+
+                sources.V[i].d_thermal_b1.array() =
+                    (part.A_thermal.value.array() *
+                         sources.Y_plus[i].value.array() *
+                         sources.D_minus_thermal[i].d_thermal_b1.array() +
+                     part.A_thermal.value.array() *
+                         sources.Y_minus[i].value.array() *
+                         sources.D_plus_thermal[i].d_thermal_b1.array());
+            }
 
             // Add in homogeneous sources
             sources.source.value.array() +=
-                azi_factor * (solution.bvp_coeffs[i]
-                                  .rhs(Eigen::seq(0, Eigen::last, 2), 0)
-                                  .array() *
-                              sources.Y_plus[i].value.array() *
-                              sources.H_plus[i].value.array());
+                azi_factor *
+                (solution.bvp_coeffs[i]
+                     .rhs(Eigen::seq(0, Eigen::placeholders::last, 2), 0)
+                     .array() *
+                 sources.Y_plus[i].value.array() *
+                 sources.H_plus[i].value.array());
 
             // Append the derivative
             sources.source.d_ssa.array() +=
-                azi_factor * (solution.bvp_coeffs[i]
-                                  .rhs(Eigen::seq(0, Eigen::last, 2), 0)
-                                  .array() *
-                              (sources.Y_plus[i].d_ssa.array() *
-                                   sources.H_plus[i].value.array() +
-                               sources.Y_plus[i].value.array() *
-                                   sources.H_plus[i].d_ssa.array()));
+                azi_factor *
+                (solution.bvp_coeffs[i]
+                     .rhs(Eigen::seq(0, Eigen::placeholders::last, 2), 0)
+                     .array() *
+                 (sources.Y_plus[i].d_ssa.array() *
+                      sources.H_plus[i].value.array() +
+                  sources.Y_plus[i].value.array() *
+                      sources.H_plus[i].d_ssa.array()));
 
             sources.source.d_b1.array() +=
-                azi_factor * (solution.bvp_coeffs[i]
-                                  .rhs(Eigen::seq(0, Eigen::last, 2), 0)
-                                  .array() *
-                              (sources.Y_plus[i].d_b1.array() *
-                                   sources.H_plus[i].value.array() +
-                               sources.Y_plus[i].value.array() *
-                                   sources.H_plus[i].d_b1.array()));
+                azi_factor *
+                (solution.bvp_coeffs[i]
+                     .rhs(Eigen::seq(0, Eigen::placeholders::last, 2), 0)
+                     .array() *
+                 (sources.Y_plus[i].d_b1.array() *
+                      sources.H_plus[i].value.array() +
+                  sources.Y_plus[i].value.array() *
+                      sources.H_plus[i].d_b1.array()));
 
             // H_plus has extra derivatives wrt to od
             sources.source.d_od.array() +=
-                azi_factor * (solution.bvp_coeffs[i]
-                                  .rhs(Eigen::seq(0, Eigen::last, 2), 0)
-                                  .array() *
-                              (sources.Y_plus[i].value.array() *
-                               sources.H_plus[i].d_od.array()));
+                azi_factor *
+                (solution.bvp_coeffs[i]
+                     .rhs(Eigen::seq(0, Eigen::placeholders::last, 2), 0)
+                     .array() *
+                 (sources.Y_plus[i].value.array() *
+                  sources.H_plus[i].d_od.array()));
 
             // Second term
             sources.source.value.array() +=
-                azi_factor * (solution.bvp_coeffs[i]
-                                  .rhs(Eigen::seq(1, Eigen::last, 2), 0)
-                                  .array() *
-                              sources.Y_minus[i].value.array() *
-                              sources.H_minus[i].value.array());
+                azi_factor *
+                (solution.bvp_coeffs[i]
+                     .rhs(Eigen::seq(1, Eigen::placeholders::last, 2), 0)
+                     .array() *
+                 sources.Y_minus[i].value.array() *
+                 sources.H_minus[i].value.array());
 
             sources.source.d_ssa.array() +=
-                azi_factor * (solution.bvp_coeffs[i]
-                                  .rhs(Eigen::seq(1, Eigen::last, 2), 0)
-                                  .array() *
-                              (sources.Y_minus[i].d_ssa.array() *
-                                   sources.H_minus[i].value.array() +
-                               sources.Y_minus[i].value.array() *
-                                   sources.H_minus[i].d_ssa.array()));
+                azi_factor *
+                (solution.bvp_coeffs[i]
+                     .rhs(Eigen::seq(1, Eigen::placeholders::last, 2), 0)
+                     .array() *
+                 (sources.Y_minus[i].d_ssa.array() *
+                      sources.H_minus[i].value.array() +
+                  sources.Y_minus[i].value.array() *
+                      sources.H_minus[i].d_ssa.array()));
 
             sources.source.d_b1.array() +=
-                azi_factor * (solution.bvp_coeffs[i]
-                                  .rhs(Eigen::seq(1, Eigen::last, 2), 0)
-                                  .array() *
-                              (sources.Y_minus[i].d_b1.array() *
-                                   sources.H_minus[i].value.array() +
-                               sources.Y_minus[i].value.array() *
-                                   sources.H_minus[i].d_b1.array()));
+                azi_factor *
+                (solution.bvp_coeffs[i]
+                     .rhs(Eigen::seq(1, Eigen::placeholders::last, 2), 0)
+                     .array() *
+                 (sources.Y_minus[i].d_b1.array() *
+                      sources.H_minus[i].value.array() +
+                  sources.Y_minus[i].value.array() *
+                      sources.H_minus[i].d_b1.array()));
 
             // Extra derivatives wrt to od
             sources.source.d_od.array() +=
-                azi_factor * (solution.bvp_coeffs[i]
-                                  .rhs(Eigen::seq(1, Eigen::last, 2), 0)
-                                  .array() *
-                              (sources.Y_minus[i].value.array() *
-                               sources.H_minus[i].d_od.array()));
+                azi_factor *
+                (solution.bvp_coeffs[i]
+                     .rhs(Eigen::seq(1, Eigen::placeholders::last, 2), 0)
+                     .array() *
+                 (sources.Y_minus[i].value.array() *
+                  sources.H_minus[i].d_od.array()));
 
             // And keep track of the gradients for backprop
             sources.d_bvp_coeff[i](Eigen::seq(0, 2 * input.nlyr - 1, 2))
@@ -1158,10 +1951,38 @@ namespace sasktran2::twostream {
                 azi_factor * (sources.V[i].d_b1.array());
             sources.source.d_od.array() +=
                 azi_factor * (sources.V[i].d_od.array());
-            sources.source.d_transmission.array() +=
-                azi_factor * (sources.V[i].d_transmission.array());
-            sources.source.d_secant.array() +=
-                azi_factor * (sources.V[i].d_secant.array());
+
+            if constexpr (has_solar<source_type>()) {
+                sources.source.d_transmission.array() +=
+                    azi_factor * (sources.V[i].d_transmission.array());
+                sources.source.d_secant.array() +=
+                    azi_factor * (sources.V[i].d_secant.array());
+            }
+
+            if constexpr (has_thermal<source_type>()) {
+                sources.source.d_thermal_b0.array() +=
+                    azi_factor * (sources.V[i].d_thermal_b0.array());
+                sources.source.d_thermal_b1.array() +=
+                    azi_factor * (sources.V[i].d_thermal_b1.array());
+
+                // Add in the direct thermal source
+                sources.source.value.array() +=
+                    input.b0_thermal.array() * sources.E_thermal.value.array() *
+                    (1.0 - input.ssa.array());
+
+                // Include derivatives from the direct thermal source term.
+                sources.source.d_thermal_b0.array() +=
+                    sources.E_thermal.value.array() * (1.0 - input.ssa.array());
+                sources.source.d_thermal_b1.array() +=
+                    input.b0_thermal.array() *
+                    sources.E_thermal.d_thermal_b1.array() *
+                    (1.0 - input.ssa.array());
+                sources.source.d_ssa.array() +=
+                    -input.b0_thermal.array() * sources.E_thermal.value.array();
+                sources.source.d_od.array() += input.b0_thermal.array() *
+                                               sources.E_thermal.d_od.array() *
+                                               (1.0 - input.ssa.array());
+            }
         }
     }
 } // namespace sasktran2::twostream

@@ -26,7 +26,7 @@ classifiers = [
 
 [project.optional-dependencies]
 test = ["pytest"]
-solar = ["astropy"]
+solar = ["astropy>=7"]
 hapi = ["hitran-api"]
 dev = ["ruff", "sphinx", "sphinx_book_theme", "myst-nb", "sphinx_design", "sphinx-github-changelog", "sphinxcontrib-bibtex"]
 complete = ["sasktran2[solar,hapi]"]
@@ -66,7 +66,7 @@ xarray = ">=2023.0.0"
 scipy = "*"
 netcdf4 = "*"
 pytest = ">=8.3.4,<9"
-astropy = "*"
+astropy = ">=7"
 ruff = "*"
 sphinx = "*"
 myst-nb = "*"
@@ -95,7 +95,10 @@ manifest-path = "rust/sasktran2-py-ext/Cargo.toml"
 python-source = "src"
 python-packages = ["sasktran2"]
 module-name = "sasktran2._core_rust"
-include = [{ path = "rust-toolchain.toml", format = "sdist" }]
+include = [
+    { path = "rust-toolchain.toml", format = "sdist" },
+    { path = "Cargo.lock", format = "sdist" },
+]
 
 [tool.pytest.ini_options]
 minversion = "6.0"
