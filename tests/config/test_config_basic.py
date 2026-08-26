@@ -114,6 +114,20 @@ def test_wavelength_batch_size_round_trip_and_validation():
         config.wavelength_batch_size = 0
 
 
+def test_los_refraction_tangent_altitude_limit_round_trip_and_validation():
+    config = sk.Config()
+
+    assert np.isinf(config.los_refraction_max_tangent_altitude_m)
+    config.los_refraction_max_tangent_altitude_m = 25_000.0
+    assert config.los_refraction_max_tangent_altitude_m == 25_000.0
+    config.los_refraction_max_tangent_altitude_m = np.inf
+    assert np.isinf(config.los_refraction_max_tangent_altitude_m)
+
+    for invalid in (-1.0, np.nan):
+        with pytest.raises(RuntimeError, match="non-negative or infinity"):
+            config.los_refraction_max_tangent_altitude_m = invalid
+
+
 def test_cpp_successive_orders_controls_round_trip_and_validation():
     config = sk.Config()
 
@@ -178,3 +192,37 @@ def test_cpp_successive_orders_altitude_grid_round_trip_and_validation():
     config.successive_orders_altitude_grid_m = expected
     config.successive_orders_altitude_grid_m = None
     assert config.successive_orders_altitude_grid_m is None
+
+
+def test_cpp_successive_orders_horizontal_angle_grid_round_trip_and_validation():
+    config = sk.Config()
+    assert config.successive_orders_horizontal_angle_grid_radians is None
+
+    expected = np.array([-0.3, -0.05, 0.1, 0.4])
+    config.successive_orders_horizontal_angle_grid_radians = expected
+    np.testing.assert_array_equal(
+        config.successive_orders_horizontal_angle_grid_radians, expected
+    )
+
+    returned = config.successive_orders_horizontal_angle_grid_radians
+    returned[0] = -1.0
+    np.testing.assert_array_equal(
+        config.successive_orders_horizontal_angle_grid_radians, expected
+    )
+
+    for invalid in (
+        np.array([[-0.2, 0.2]]),
+        np.array([-0.1, -0.1]),
+        np.array([0.2, -0.2]),
+        np.array([0.0, np.nan]),
+    ):
+        with pytest.raises(
+            ValueError, match="successive_orders_horizontal_angle_grid_radians"
+        ):
+            config.successive_orders_horizontal_angle_grid_radians = invalid
+
+    config.successive_orders_horizontal_angle_grid_radians = np.array([])
+    assert config.successive_orders_horizontal_angle_grid_radians is None
+    config.successive_orders_horizontal_angle_grid_radians = expected
+    config.successive_orders_horizontal_angle_grid_radians = None
+    assert config.successive_orders_horizontal_angle_grid_radians is None

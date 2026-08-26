@@ -86,6 +86,17 @@ impl Atmosphere {
         Ok(())
     }
 
+    pub fn mark_surface_changed(&self) -> Result<()> {
+        let result = unsafe { ffi::sk_atmosphere_mark_surface_changed(self.atmosphere) };
+        if result != 0 {
+            return Err(anyhow!(
+                "Error marking atmosphere surface changed: {}",
+                result
+            ));
+        }
+        Ok(())
+    }
+
     pub fn revision(&self) -> Result<u64> {
         let mut revision = 0u64;
         let result = unsafe { ffi::sk_atmosphere_get_revision(self.atmosphere, &mut revision) };
@@ -93,6 +104,29 @@ impl Atmosphere {
             return Err(anyhow!("Error getting atmosphere revision: {}", result));
         }
         Ok(revision)
+    }
+
+    pub fn volume_revision(&self) -> Result<u64> {
+        let mut revision = 0u64;
+        let result =
+            unsafe { ffi::sk_atmosphere_get_volume_revision(self.atmosphere, &mut revision) };
+        if result != 0 {
+            return Err(anyhow!(
+                "Error getting atmosphere volume revision: {}",
+                result
+            ));
+        }
+        Ok(revision)
+    }
+
+    pub fn instance_id(&self) -> Result<u64> {
+        let mut instance_id = 0u64;
+        let result =
+            unsafe { ffi::sk_atmosphere_get_instance_id(self.atmosphere, &mut instance_id) };
+        if result != 0 {
+            return Err(anyhow!("Error getting atmosphere instance ID: {}", result));
+        }
+        Ok(instance_id)
     }
 
     /// Number of stokes parameters
@@ -133,9 +167,15 @@ mod tests {
 
         // check that atmosphere storage is not null
         assert!(!atmosphere.atmosphere.is_null());
+        assert_ne!(atmosphere.instance_id().unwrap(), 0);
         assert_eq!(atmosphere.revision().unwrap(), 0);
+        assert_eq!(atmosphere.volume_revision().unwrap(), 0);
         atmosphere.mark_changed().unwrap();
         assert_eq!(atmosphere.revision().unwrap(), 1);
+        assert_eq!(atmosphere.volume_revision().unwrap(), 1);
+        atmosphere.mark_surface_changed().unwrap();
+        assert_eq!(atmosphere.revision().unwrap(), 2);
+        assert_eq!(atmosphere.volume_revision().unwrap(), 1);
     }
 
     #[test]

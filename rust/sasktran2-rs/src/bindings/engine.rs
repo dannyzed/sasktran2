@@ -7,11 +7,11 @@ use super::geometry::{Geometry1D, Geometry2D};
 use super::output::{JvpOutput, Output, VjpOutput};
 use super::prelude::*;
 use super::viewing_geometry::ViewingGeometry;
-use ndarray::{Array1, Array3};
+use ndarray::{Array1, Array2, Array3, ArrayView2};
 use rayon::current_thread_index;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use sasktran2_sys::ffi;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -156,6 +156,236 @@ fn safe_calc_vjp_block_thread(
     }
 }
 
+struct RadianceBlockTask {
+    engine: SafeFFIEngine,
+    output: SafeFFIOutput,
+    wavelength_start: usize,
+    wavelength_count: usize,
+}
+
+struct JvpWavelengthTask {
+    engine: SafeFFIEngine,
+    output: SafeFFIJvpOutput,
+    wavelength: usize,
+}
+
+struct VjpBlockTask {
+    engine: SafeFFIEngine,
+    output: SafeFFIVjpOutput,
+    wavelength_start: usize,
+    wavelength_count: usize,
+}
+
+struct RefractiveProfileTask {
+    engine: SafeFFIEngine,
+    profile_index: usize,
+}
+
+/// Execute already-initialized radiance outputs over one shared pool of
+/// `(engine, wavelength block)` tasks. This is intended for composite engines
+/// whose children share a wavelength-threaded configuration.
+pub fn calculate_prepared_radiances(
+    engines: &[&Engine<'_>],
+    outputs: &[Output],
+    num_wavel: usize,
+    num_threads: usize,
+) -> Result<()> {
+    if engines.len() != outputs.len() {
+        return Err(anyhow::anyhow!(
+            "Prepared radiance engine/output counts do not match"
+        ));
+    }
+    crate::threading::set_num_threads(num_threads)?;
+    let mut tasks = Vec::new();
+    for (engine, output) in engines.iter().zip(outputs) {
+        let batch_size = engine.effective_wavelength_batch_size(num_wavel)?;
+        for wavelength_start in (0..num_wavel).step_by(batch_size) {
+            tasks.push(RadianceBlockTask {
+                engine: SafeFFIEngine(engine.engine),
+                output: SafeFFIOutput(output.output),
+                wavelength_start,
+                wavelength_count: (num_wavel - wavelength_start).min(batch_size),
+            });
+        }
+    }
+    rayon_for_each_worker(tasks.len(), num_threads, |task_index, thread_idx| {
+        let task = &tasks[task_index];
+        safe_calc_block_thread(
+            &task.engine,
+            &task.output,
+            task.wavelength_start as i32,
+            task.wavelength_count as i32,
+            thread_idx,
+        )
+    })
+}
+
+/// Execute already-initialized native JVP outputs over one shared pool of
+/// `(engine, wavelength)` tasks.
+pub fn calculate_prepared_jvps(
+    engines: &[&Engine<'_>],
+    outputs: &[JvpOutput],
+    num_wavel: usize,
+    num_threads: usize,
+) -> Result<()> {
+    if engines.len() != outputs.len() {
+        return Err(anyhow::anyhow!(
+            "Prepared JVP engine/output counts do not match"
+        ));
+    }
+    crate::threading::set_num_threads(num_threads)?;
+    let mut tasks = Vec::with_capacity(engines.len() * num_wavel);
+    for (engine, output) in engines.iter().zip(outputs) {
+        for wavelength in 0..num_wavel {
+            tasks.push(JvpWavelengthTask {
+                engine: SafeFFIEngine(engine.engine),
+                output: SafeFFIJvpOutput(output.output),
+                wavelength,
+            });
+        }
+    }
+    rayon_for_each_worker(tasks.len(), num_threads, |task_index, thread_idx| {
+        let task = &tasks[task_index];
+        safe_calc_jvp_wavelength_thread(
+            &task.engine,
+            &task.output,
+            task.wavelength as i32,
+            thread_idx,
+        )
+    })
+}
+
+/// Execute already-initialized native VJP outputs over one shared pool of
+/// `(engine, wavelength block)` tasks, then reduce every output.
+pub fn calculate_prepared_vjps(
+    engines: &[&Engine<'_>],
+    outputs: &[VjpOutput],
+    num_wavel: usize,
+    num_threads: usize,
+) -> Result<()> {
+    if engines.len() != outputs.len() {
+        return Err(anyhow::anyhow!(
+            "Prepared VJP engine/output counts do not match"
+        ));
+    }
+    crate::threading::set_num_threads(num_threads)?;
+    let mut tasks = Vec::new();
+    for (engine, output) in engines.iter().zip(outputs) {
+        let batch_size = engine.effective_wavelength_batch_size(num_wavel)?;
+        for wavelength_start in (0..num_wavel).step_by(batch_size) {
+            tasks.push(VjpBlockTask {
+                engine: SafeFFIEngine(engine.engine),
+                output: SafeFFIVjpOutput(output.output),
+                wavelength_start,
+                wavelength_count: (num_wavel - wavelength_start).min(batch_size),
+            });
+        }
+    }
+    let worker_result =
+        rayon_for_each_worker(tasks.len(), num_threads, |task_index, thread_idx| {
+            let task = &tasks[task_index];
+            safe_calc_vjp_block_thread(
+                &task.engine,
+                &task.output,
+                task.wavelength_start as i32,
+                task.wavelength_count as i32,
+                thread_idx,
+            )
+        });
+    let mut finalize_result = Ok(());
+    for output in outputs {
+        let result = unsafe { ffi::sk_output_vjp_finalize(output.output) };
+        if result != 0 && finalize_result.is_ok() {
+            finalize_result = Err(anyhow::anyhow!(
+                "Failed to finalize prepared VJP: {}",
+                result
+            ));
+        }
+    }
+    worker_result?;
+    finalize_result
+}
+
+/// Refresh independent structured-2D engines on the shared Rayon pool.
+///
+/// Every engine must be unique because the underlying C++ call mutates its
+/// geometry-dependent state. Per-engine results are retained so a composite
+/// caller can update the cache metadata for every successful refresh even if
+/// another group rejects its profile.
+pub fn set_2d_refractive_profiles_parallel(
+    engines: &[&Engine<'_>],
+    profiles: &[Array2<f64>],
+    num_threads: usize,
+) -> Result<Vec<Result<()>>> {
+    if engines.len() != profiles.len() {
+        return Err(anyhow::anyhow!(
+            "Refractive-profile engine/profile counts do not match"
+        ));
+    }
+    if num_threads == 0 {
+        return Err(anyhow::anyhow!(
+            "Refractive-profile thread count must be positive"
+        ));
+    }
+
+    let mut engine_addresses = HashSet::with_capacity(engines.len());
+    let mut tasks = Vec::with_capacity(engines.len());
+    for (profile_index, (engine, profile)) in engines.iter().zip(profiles).enumerate() {
+        if !matches!(&engine.geometry, EngineGeometry::TwoDimensional(_)) {
+            return Err(anyhow::anyhow!(
+                "Per-ray refractive profiles require Geometry2D engines"
+            ));
+        }
+        if !engine_addresses.insert(engine.engine as usize) {
+            return Err(anyhow::anyhow!(
+                "Parallel refractive-profile refresh requires unique engines"
+            ));
+        }
+        if !profile.is_standard_layout() {
+            return Err(anyhow::anyhow!(
+                "Parallel refractive profiles must use standard row-major layout"
+            ));
+        }
+        if profile.nrows() > i32::MAX as usize || profile.ncols() > i32::MAX as usize {
+            return Err(anyhow::anyhow!(
+                "Parallel refractive-profile dimensions exceed the C API range"
+            ));
+        }
+        tasks.push(RefractiveProfileTask {
+            engine: SafeFFIEngine(engine.engine),
+            profile_index,
+        });
+    }
+
+    crate::threading::set_num_threads(num_threads)?;
+    let thread_pool = threading::thread_pool()?;
+    Ok(thread_pool.install(|| {
+        tasks
+            .into_par_iter()
+            .map(|task| {
+                let profile = &profiles[task.profile_index];
+                let result = unsafe {
+                    ffi::sk_engine_set_2d_refractive_profiles(
+                        task.engine.0,
+                        profile.as_ptr(),
+                        profile.nrows() as i32,
+                        profile.ncols() as i32,
+                    )
+                };
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Failed to set Geometry2D refractive profiles for engine {}: {}",
+                        task.profile_index,
+                        result
+                    ))
+                }
+            })
+            .collect()
+    }))
+}
+
 impl<'a> Engine<'a> {
     fn use_rayon_wavelength_threading(&self) -> Result<bool> {
         Ok(
@@ -239,6 +469,92 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Refresh a structured-2D engine with one altitude-only refractive
+    /// profile per line of sight. The C++ engine retains its allocations and
+    /// rebuilds only geometry-dependent state.
+    pub fn set_2d_refractive_profiles(&mut self, profiles: ArrayView2<'_, f64>) -> Result<()> {
+        if !matches!(self.geometry, EngineGeometry::TwoDimensional(_)) {
+            return Err(anyhow::anyhow!(
+                "Per-ray refractive profiles require a Geometry2D engine"
+            ));
+        }
+        let profiles = profiles.as_standard_layout();
+        let shape = profiles.shape();
+        let result = unsafe {
+            ffi::sk_engine_set_2d_refractive_profiles(
+                self.engine,
+                profiles.as_ptr(),
+                shape[0] as i32,
+                shape[1] as i32,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "Failed to set Geometry2D refractive profiles: {}",
+                result
+            ))
+        }
+    }
+
+    pub fn surface_interpolation_weights(&self) -> Result<Array2<f64>> {
+        let num_horizontal = match self.geometry {
+            EngineGeometry::TwoDimensional(geometry) => geometry.location_shape()?.0,
+            EngineGeometry::OneDimensional(_) => {
+                return Err(anyhow::anyhow!(
+                    "Surface interpolation weights require a Geometry2D engine"
+                ));
+            }
+        };
+        let num_rays = self.viewing_geometry.num_rays()?;
+        let mut weights = Array2::zeros((num_rays, num_horizontal));
+        let result = unsafe {
+            ffi::sk_engine_get_2d_surface_interpolation_weights(
+                self.engine,
+                weights.as_mut_ptr(),
+                num_rays as i32,
+                num_horizontal as i32,
+            )
+        };
+        if result == 0 {
+            Ok(weights)
+        } else {
+            Err(anyhow::anyhow!(
+                "Failed to obtain Geometry2D surface interpolation weights: {}",
+                result
+            ))
+        }
+    }
+
+    pub fn horizontal_edge_usage(&self) -> Result<Array2<i32>> {
+        match self.geometry {
+            EngineGeometry::TwoDimensional(_) => {}
+            EngineGeometry::OneDimensional(_) => {
+                return Err(anyhow::anyhow!(
+                    "Horizontal edge usage requires a Geometry2D engine"
+                ));
+            }
+        }
+        let num_rays = self.viewing_geometry.num_rays()?;
+        let mut usage = Array2::zeros((num_rays, 2));
+        let result = unsafe {
+            ffi::sk_engine_get_2d_horizontal_edge_usage(
+                self.engine,
+                usage.as_mut_ptr(),
+                num_rays as i32,
+            )
+        };
+        if result == 0 {
+            Ok(usage)
+        } else {
+            Err(anyhow::anyhow!(
+                "Failed to obtain Geometry2D horizontal edge usage: {}",
+                result
+            ))
+        }
+    }
+
     pub fn linearization_backend(&self, mode: LinearizationMode) -> Result<LinearizationBackend> {
         let mut backend = 0i32;
         let result =
@@ -261,6 +577,133 @@ impl<'a> Engine<'a> {
     }
 
     pub fn calculate_radiance(&self, atmosphere: &Atmosphere) -> Result<Output> {
+        let derivative_names = atmosphere
+            .storage
+            .derivative_mapping_names()
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let surface_names = atmosphere
+            .surface
+            .derivative_mapping_names()
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.calculate_radiance_with_mappings(atmosphere, &derivative_names, &surface_names)
+    }
+
+    pub fn effective_wavelength_batch_size(&self, num_wavel: usize) -> Result<usize> {
+        let batch_size = unsafe {
+            ffi::sk_engine_effective_wavelength_batch_size(self.engine, num_wavel as i32)
+        };
+        if batch_size < 1 {
+            Err(anyhow::anyhow!(
+                "Failed to determine wavelength batch size: {}",
+                batch_size
+            ))
+        } else {
+            Ok(batch_size as usize)
+        }
+    }
+
+    /// Initialize a primal-only output without executing wavelength blocks.
+    pub fn initialize_radiance_only(&self, atmosphere: &Atmosphere) -> Result<Output> {
+        crate::threading::set_num_threads(self.config.num_threads()?)?;
+        let output = Output::new(
+            atmosphere.num_wavel(),
+            self.viewing_geometry.num_rays()?,
+            self.viewing_geometry.num_flux_observers()?,
+            self.config.num_flux_types()?,
+            self.config.num_stokes()?,
+        );
+        let result = unsafe {
+            ffi::sk_engine_calculate_radiance(self.engine, atmosphere.atmosphere, output.output, 1)
+        };
+        if result != 0 {
+            return Err(anyhow::anyhow!("Failed to initialize radiance: {}", result));
+        }
+        Ok(output)
+    }
+
+    /// Initialize a native JVP output without executing wavelength tasks.
+    pub fn initialize_jvp(
+        &self,
+        atmosphere: &Atmosphere,
+        derivative_tangents: &HashMap<String, Array1<f64>>,
+        surface_tangents: &HashMap<String, Array1<f64>>,
+    ) -> Result<JvpOutput> {
+        crate::threading::set_num_threads(self.config.num_threads()?)?;
+        let mut output = JvpOutput::try_new(
+            atmosphere.num_wavel(),
+            self.viewing_geometry.num_rays()?,
+            self.config.num_stokes()?,
+        )
+        .map_err(anyhow::Error::msg)?;
+        for (name, tangent) in derivative_tangents {
+            output
+                .with_derivative_tangent(name, tangent)
+                .map_err(anyhow::Error::msg)?;
+        }
+        for (name, tangent) in surface_tangents {
+            output
+                .with_surface_tangent(name, tangent)
+                .map_err(anyhow::Error::msg)?;
+        }
+        let result = unsafe {
+            ffi::sk_engine_initialize_jvp(self.engine, atmosphere.atmosphere, output.output)
+        };
+        if result != 0 {
+            return Err(anyhow::anyhow!("Failed to initialize JVP: {}", result));
+        }
+        Ok(output)
+    }
+
+    /// Initialize a native VJP output without executing wavelength blocks.
+    pub fn initialize_vjp(
+        &self,
+        atmosphere: &Atmosphere,
+        cotangent: &Array3<f64>,
+        derivative_sizes: &HashMap<String, usize>,
+        surface_sizes: &HashMap<String, usize>,
+    ) -> Result<VjpOutput> {
+        crate::threading::set_num_threads(self.config.num_threads()?)?;
+        let expected = (
+            atmosphere.num_wavel(),
+            self.viewing_geometry.num_rays()?,
+            self.config.num_stokes()?,
+        );
+        if cotangent.dim() != expected {
+            return Err(anyhow::anyhow!(
+                "Radiance cotangent shape {:?} does not match {:?}",
+                cotangent.dim(),
+                expected
+            ));
+        }
+        let mut output = VjpOutput::try_new(cotangent).map_err(anyhow::Error::msg)?;
+        for (name, size) in derivative_sizes {
+            output
+                .with_derivative_gradient(name, *size)
+                .map_err(anyhow::Error::msg)?;
+        }
+        for (name, size) in surface_sizes {
+            output
+                .with_surface_gradient(name, *size)
+                .map_err(anyhow::Error::msg)?;
+        }
+        let result = unsafe {
+            ffi::sk_engine_initialize_vjp(self.engine, atmosphere.atmosphere, output.output)
+        };
+        if result != 0 {
+            return Err(anyhow::anyhow!("Failed to initialize VJP: {}", result));
+        }
+        Ok(output)
+    }
+
+    /// Calculate radiance while allocating only the requested derivative
+    /// outputs. An empty pair of mapping collections is a true radiance-only
+    /// calculation even when the atmosphere contains derivative mappings.
+    pub fn calculate_radiance_with_mappings(
+        &self,
+        atmosphere: &Atmosphere,
+        derivative_names: &[String],
+        surface_names: &[String],
+    ) -> Result<Output> {
         crate::threading::set_num_threads(self.config.num_threads()?)?;
 
         let num_stokes = self.config.num_stokes()?;
@@ -271,13 +714,8 @@ impl<'a> Engine<'a> {
 
         let mut output = Output::new(num_wavel, num_los, num_flux, num_flux_types, num_stokes);
 
-        let deriv_names = atmosphere
-            .storage
-            .derivative_mapping_names()
-            .map_err(|e| anyhow::anyhow!(e))?;
-
         // Assign the memory for the derivatives
-        for deriv_name in deriv_names.iter() {
+        for deriv_name in derivative_names {
             let mapping = atmosphere
                 .storage
                 .get_derivative_mapping(deriv_name)
@@ -287,11 +725,13 @@ impl<'a> Engine<'a> {
             output.with_derivative(deriv_name, num_deriv_output);
         }
 
-        let deriv_names = atmosphere
-            .surface
-            .derivative_mapping_names()
-            .map_err(|e| anyhow::anyhow!(e))?;
-        for deriv_name in deriv_names.iter() {
+        for deriv_name in surface_names {
+            // Resolve the name here so an invalid selection fails before the
+            // native calculation instead of creating an unattached output.
+            atmosphere
+                .surface
+                .get_derivative_mapping(deriv_name)
+                .map_err(|e| anyhow::anyhow!(e))?;
             output.with_surface_derivative(deriv_name);
         }
 
@@ -887,6 +1327,13 @@ mod tests {
 
         config
             .with_multiple_scatter_source(MultipleScatterSource::SuccessiveOrdersLegacy)
+            .unwrap();
+        assert!(Engine::new_2d(&config, &geometry, &viewing_geometry).is_err());
+
+        config
+            .with_multiple_scatter_source(MultipleScatterSource::None)
+            .unwrap()
+            .with_single_scatter_source(SingleScatterSource::DiscreteOrdinates)
             .unwrap();
         assert!(Engine::new_2d(&config, &geometry, &viewing_geometry).is_err());
 

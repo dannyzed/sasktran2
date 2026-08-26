@@ -26,6 +26,10 @@ namespace sasktran2::successive_orders {
          * midpoint. */
         std::vector<double> altitude_grid_m;
 
+        /** Empty selects an evenly spaced Geometry2D horizontal grid with
+         * num_sza points. Values are local Geometry2D angles in radians. */
+        std::vector<double> horizontal_angle_grid_radians;
+
         void validate() const;
     };
 
@@ -91,6 +95,12 @@ namespace sasktran2::successive_orders {
                        internal_viewing,
                    const SourceGeometrySettings& settings);
 
+        /** Recompile only observer-LOS interpolation and transport topology.
+         * Source points and diffuse incoming rays are unchanged. */
+        void
+        refresh_los(const sasktran2::viewinggeometry::InternalViewingGeometry&
+                        internal_viewing);
+
         const SourceGeometrySettings& settings() const { return m_settings; }
         const std::vector<double>& source_altitudes_m() const {
             return m_source_altitudes_m;
@@ -123,6 +133,10 @@ namespace sasktran2::successive_orders {
         }
         const SourcePoint& source_point(int index) const {
             return m_source_points.at(index);
+        }
+        const std::vector<std::pair<int, double>>&
+        ground_horizontal_weights(int ground_index) const {
+            return m_ground_horizontal_weights.at(ground_index);
         }
         const std::vector<int>& incoming_point_offsets() const {
             return m_incoming_point_offsets;
@@ -225,6 +239,8 @@ namespace sasktran2::successive_orders {
         std::vector<double> m_source_altitudes_m;
         std::vector<double> m_source_cos_sza;
         std::vector<double> m_source_horizontal_angles_rad;
+        std::vector<std::vector<std::pair<int, double>>>
+            m_ground_horizontal_weights;
         int m_num_interior_points = 0;
         int m_num_ground_points = 0;
 

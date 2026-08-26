@@ -39,7 +39,8 @@ namespace sasktran2::successive_orders {
         void initialize_config(const sasktran2::Config& config);
         void initialize_geometry(const SourceGeometry1D& source_geometry);
         void initialize_atmosphere(
-            const sasktran2::atmosphere::Atmosphere<NSTOKES>& atmosphere);
+            const sasktran2::atmosphere::Atmosphere<NSTOKES>& atmosphere,
+            bool volume_changed = true);
 
         int size() const { return m_num_rays * NSTOKES; }
 
@@ -140,6 +141,13 @@ namespace sasktran2::successive_orders {
             bool active = false;
         };
 
+        struct ScalarVolumeCache {
+            Eigen::VectorXd forcing;
+            Eigen::VectorXd transport_values;
+            Eigen::VectorXd ground_prefix;
+            bool active = false;
+        };
+
         struct ScalarPackedLayer {
             // Keep only owned scalar metadata here. Geometry stencil views are
             // reacquired from SourceGeometry1D so their backing storage and
@@ -205,6 +213,13 @@ namespace sasktran2::successive_orders {
             const Eigen::VectorXd* layer_state_projection,
             const Eigen::VectorXd* ground_state_projection);
         template <bool WITH_TRANSPORT, bool LOWER_INTERPOLATION>
+        void accumulate_scalar_surface_vjp(
+            int wavelength, int wavelength_thread,
+            Eigen::Ref<const Eigen::VectorXd> forcing_cotangent,
+            Eigen::Ref<Eigen::VectorXd> native_gradient,
+            const Eigen::VectorXd* transport_state,
+            const Eigen::VectorXd* ground_state_projection);
+        template <bool WITH_TRANSPORT, bool LOWER_INTERPOLATION>
         void accumulate_scalar_vjp_impl(
             int wavelength, int wavelength_thread,
             Eigen::Ref<const Eigen::VectorXd> forcing_cotangent,
@@ -253,6 +268,12 @@ namespace sasktran2::successive_orders {
                                         const ScalarGroundGeometry& ground,
                                         double& mu_in, double& mu_out,
                                         double& phi) const;
+        double ground_transport_albedo(int wavelength, int ray) const;
+        double ground_transport_albedo_tangent(
+            int ray, Eigen::Ref<const Eigen::VectorXd> native_tangent) const;
+        void accumulate_ground_transport_albedo_vjp(
+            int ray, double albedo_cotangent,
+            Eigen::Ref<Eigen::VectorXd> native_gradient) const;
 
         const sasktran2::Geometry& m_geometry;
         const sasktran2::Geometry1D* m_geometry_1d = nullptr;
@@ -264,6 +285,8 @@ namespace sasktran2::successive_orders {
             m_solar_interpolation;
         std::vector<bool> m_solar_ground_hit;
         std::vector<Eigen::Vector3d> m_solar_propagation_directions;
+        std::vector<std::vector<std::pair<int, double>>>
+            m_ground_horizontal_weights;
         sasktran2::SourceIntegrator<NSTOKES> m_integrator;
         std::vector<SourceTermInterface<NSTOKES>*> m_source_terms;
         const sasktran2::atmosphere::Atmosphere<NSTOKES>* m_atmosphere =
@@ -314,6 +337,7 @@ namespace sasktran2::successive_orders {
         std::vector<unsigned char> m_cached_solar_active;
         std::vector<ScalarLayerCache> m_scalar_layer_cache;
         std::vector<ScalarEndpointMediumCache> m_endpoint_medium_cache;
+        std::vector<ScalarVolumeCache> m_scalar_volume_cache;
         mutable std::vector<ScalarVjpScratch> m_scalar_vjp_scratch;
     };
 

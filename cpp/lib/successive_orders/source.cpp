@@ -45,6 +45,9 @@ namespace sasktran2::successive_orders {
         void initialize_geometry(
             const sasktran2::viewinggeometry::InternalViewingGeometry&
                 internal_viewing) override;
+        void refresh_los_geometry(
+            const sasktran2::viewinggeometry::InternalViewingGeometry&
+                internal_viewing) override;
         void initialize_atmosphere(
             const sasktran2::atmosphere::Atmosphere<NSTOKES>& atmosphere)
             override;
@@ -124,18 +127,27 @@ namespace sasktran2::successive_orders {
     };
 
     namespace {
+        // Solver tolerances may deliberately be much tighter than radiometric
+        // accuracy requirements. Only warn when the unresolved fixed-point
+        // update is large enough to plausibly change the diffuse radiance at
+        // the approximately 0.1% level. The absolute floor handles vanishing
+        // states without tying warning behavior back to the solver settings.
         void warn_if_not_converged(const FixedPointDiagnostics& diagnostics,
                                    const FixedPointSettings& settings,
                                    int wavelength, const char* calculation) {
-            if (settings.convergence_enabled() && !diagnostics.converged()) {
+            if (settings.convergence_enabled() &&
+                diagnostics.warrants_convergence_warning()) {
                 spdlog::warn(
                     "C++ successive-orders {} did not converge at wavelength "
-                    "index {} after {} iterations (residual {}, threshold "
-                    "{}). Returning the current result; its accuracy may be "
-                    "reduced.",
+                    "index {} after {} iterations (residual {}, requested "
+                    "threshold {}, estimated relative unresolved state {}, "
+                    "warning threshold {}). Returning the current result; "
+                    "its accuracy may be reduced.",
                     calculation, wavelength, diagnostics.iterations,
                     diagnostics.residual_norm,
-                    diagnostics.convergence_threshold);
+                    diagnostics.convergence_threshold,
+                    diagnostics.relative_residual(),
+                    FixedPointDiagnostics::material_warning_relative_tolerance);
             }
         }
 
@@ -305,6 +317,8 @@ namespace sasktran2::successive_orders {
                 config.multiple_scatter_refraction();
             m_geometry_settings.altitude_grid_m =
                 config.successive_orders_altitude_grid_m();
+            m_geometry_settings.horizontal_angle_grid_radians =
+                config.successive_orders_horizontal_angle_grid_radians();
 
             m_solver_settings.maximum_iterations =
                 config.num_hr_spherical_iterations();
@@ -343,8 +357,6 @@ namespace sasktran2::successive_orders {
             m_scattering_assembler = std::make_unique<Assembler>(
                 m_source_geometry, m_config->num_do_streams());
 
-            create_wavelength_states(m_config->num_wavelength_threads());
-
             const int output_size = m_los_map->num_rays() * NSTOKES;
             m_thread_los_cotangent.resize(m_config->num_threads());
             for (auto& cotangent : m_thread_los_cotangent) {
@@ -357,6 +369,32 @@ namespace sasktran2::successive_orders {
             m_geometry_initialized = true;
         }
 
+        void refresh_los_geometry(
+            const sasktran2::viewinggeometry::InternalViewingGeometry&
+                internal_viewing) {
+            if (!m_geometry_initialized) {
+                initialize_geometry(internal_viewing);
+                return;
+            }
+
+            m_atmosphere = nullptr;
+            m_has_atmosphere_revision = false;
+            m_wavelength_state.clear();
+            m_vector_state_cache.clear();
+            m_source_geometry.refresh_los(internal_viewing);
+            m_los_map = std::make_unique<RayTransportMap>(
+                m_source_geometry.los_interpolation(),
+                m_source_geometry.total_num_outgoing(),
+                m_source_geometry.los_transport_row_offsets(),
+                m_source_geometry.los_transport_column_indices());
+
+            const int output_size = m_los_map->num_rays() * NSTOKES;
+            m_thread_los_cotangent.resize(m_config->num_threads());
+            for (auto& cotangent : m_thread_los_cotangent) {
+                cotangent.setZero(output_size);
+            }
+        }
+
         void initialize_atmosphere(const Atmosphere& atmosphere) {
             if (!m_geometry_initialized) {
                 throw std::logic_error(
@@ -366,12 +404,17 @@ namespace sasktran2::successive_orders {
             // Preserve directly-mutable C++ Atmosphere behavior at revision
             // zero. Python constituent builds and explicitly tracked native
             // storage opt into cache reuse by calling mark_changed().
-            if (atmosphere.revision() != 0 && m_atmosphere == &atmosphere &&
+            const bool tracked_atmosphere =
+                atmosphere.revision() != 0 && m_atmosphere == &atmosphere &&
                 m_has_atmosphere_revision &&
-                m_atmosphere_instance_id == atmosphere.instance_id() &&
+                m_atmosphere_instance_id == atmosphere.instance_id();
+            if (tracked_atmosphere &&
                 m_atmosphere_revision == atmosphere.revision()) {
                 return;
             }
+            const bool volume_changed =
+                !tracked_atmosphere ||
+                m_atmosphere_volume_revision != atmosphere.volume_revision();
             m_atmosphere = nullptr;
             // Scalar workspaces are compact enough to retain one complete
             // state per wavelength. Vector workspaces stay thread-local, but
@@ -383,6 +426,11 @@ namespace sasktran2::successive_orders {
                     create_wavelength_states(atmosphere.num_wavel());
                 }
             } else {
+                if (static_cast<int>(m_wavelength_state.size()) !=
+                    m_config->num_wavelength_threads()) {
+                    create_wavelength_states(
+                        m_config->num_wavelength_threads());
+                }
                 if (static_cast<int>(m_vector_state_cache.size()) !=
                     atmosphere.num_wavel()) {
                     m_vector_state_cache.clear();
@@ -392,10 +440,11 @@ namespace sasktran2::successive_orders {
             for (auto& state : m_wavelength_state) {
                 state->active_wavelength = -1;
             }
-            m_first_order.initialize_atmosphere(atmosphere);
+            m_first_order.initialize_atmosphere(atmosphere, volume_changed);
             m_atmosphere = &atmosphere;
             m_atmosphere_instance_id = atmosphere.instance_id();
             m_atmosphere_revision = atmosphere.revision();
+            m_atmosphere_volume_revision = atmosphere.volume_revision();
             m_has_atmosphere_revision = true;
         }
 
@@ -479,6 +528,7 @@ namespace sasktran2::successive_orders {
                            int threadidx) {
             validate_single_wavelength_block(block);
             prepare_primal(block.start, threadidx);
+            wavelength_state(block.start, threadidx).jacobian.resize(0, 0);
             reset_vjp_cotangents(threadidx);
         }
 
@@ -802,6 +852,7 @@ namespace sasktran2::successive_orders {
         const Atmosphere* m_atmosphere = nullptr;
         std::uint64_t m_atmosphere_instance_id = 0;
         std::uint64_t m_atmosphere_revision = 0;
+        std::uint64_t m_atmosphere_volume_revision = 0;
         bool m_has_atmosphere_revision = false;
         SourceGeometrySettings m_geometry_settings;
         FixedPointSettings m_solver_settings;
@@ -861,6 +912,13 @@ namespace sasktran2::successive_orders {
         const sasktran2::viewinggeometry::InternalViewingGeometry&
             internal_viewing) {
         m_impl->initialize_geometry(internal_viewing);
+    }
+
+    template <int NSTOKES>
+    void SuccessiveOrdersSource<NSTOKES>::refresh_los_geometry(
+        const sasktran2::viewinggeometry::InternalViewingGeometry&
+            internal_viewing) {
+        m_impl->refresh_los_geometry(internal_viewing);
     }
 
     template <int NSTOKES>

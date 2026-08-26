@@ -481,6 +481,37 @@ impl Config {
         }
     }
 
+    pub fn los_refraction_max_tangent_altitude_m(&self) -> Result<f64> {
+        let mut altitude_m = 0.0;
+        let error_code = unsafe {
+            ffi::sk_config_get_los_refraction_max_tangent_altitude_m(self.config, &mut altitude_m)
+        };
+        if error_code != 0 {
+            Err(anyhow!(
+                "Error getting LOS refraction tangent-altitude limit: error code {}",
+                error_code
+            ))
+        } else {
+            Ok(altitude_m)
+        }
+    }
+
+    pub fn with_los_refraction_max_tangent_altitude_m(
+        &mut self,
+        altitude_m: f64,
+    ) -> Result<&mut Self> {
+        let error_code = unsafe {
+            ffi::sk_config_set_los_refraction_max_tangent_altitude_m(self.config, altitude_m)
+        };
+        if error_code != 0 {
+            Err(anyhow!(
+                "LOS refraction maximum tangent altitude must be non-negative or infinity"
+            ))
+        } else {
+            Ok(self)
+        }
+    }
+
     pub fn output_los_optical_depth(&self) -> Result<bool> {
         let mut output_los_optical_depth = 0i32;
         let error_code = unsafe {
@@ -831,6 +862,71 @@ impl Config {
         if error_code != 0 {
             Err(anyhow!(
                 "Successive-orders altitude grid must be finite and strictly increasing"
+            ))
+        } else {
+            Ok(self)
+        }
+    }
+
+    pub fn successive_orders_horizontal_angle_grid_radians(&self) -> Result<Vec<f64>> {
+        let mut num_angles = 0i32;
+        let error_code = unsafe {
+            ffi::sk_config_get_num_successive_orders_horizontal_angles(self.config, &mut num_angles)
+        };
+        if error_code != 0 || num_angles < 0 {
+            return Err(anyhow!(
+                "Error getting successive-orders horizontal-angle-grid size: error code {}",
+                error_code
+            ));
+        }
+
+        let mut horizontal_angle_grid_radians = vec![0.0; num_angles as usize];
+        let destination = if horizontal_angle_grid_radians.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            horizontal_angle_grid_radians.as_mut_ptr()
+        };
+        let error_code = unsafe {
+            ffi::sk_config_get_successive_orders_horizontal_angle_grid_radians(
+                self.config,
+                destination,
+            )
+        };
+        if error_code != 0 {
+            Err(anyhow!(
+                "Error getting successive-orders horizontal-angle grid: error code {}",
+                error_code
+            ))
+        } else {
+            Ok(horizontal_angle_grid_radians)
+        }
+    }
+
+    pub fn with_successive_orders_horizontal_angle_grid_radians(
+        &mut self,
+        horizontal_angle_grid_radians: &[f64],
+    ) -> Result<&mut Self> {
+        if horizontal_angle_grid_radians.len() > i32::MAX as usize {
+            return Err(anyhow!(
+                "Successive-orders horizontal-angle grid contains too many points"
+            ));
+        }
+        let source = if horizontal_angle_grid_radians.is_empty() {
+            std::ptr::null()
+        } else {
+            horizontal_angle_grid_radians.as_ptr()
+        };
+        let error_code = unsafe {
+            ffi::sk_config_set_successive_orders_horizontal_angle_grid_radians(
+                self.config,
+                source,
+                horizontal_angle_grid_radians.len() as i32,
+            )
+        };
+
+        if error_code != 0 {
+            Err(anyhow!(
+                "Successive-orders horizontal-angle grid must be finite and strictly increasing"
             ))
         } else {
             Ok(self)
@@ -1234,10 +1330,18 @@ mod tests {
         );
         assert_eq!(config.successive_orders_anderson_depth().unwrap(), 3);
         assert_eq!(config.successive_orders_damping().unwrap(), 1.0);
-        assert!(config
-            .successive_orders_altitude_grid_m()
-            .unwrap()
-            .is_empty());
+        assert!(
+            config
+                .successive_orders_altitude_grid_m()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            config
+                .successive_orders_horizontal_angle_grid_radians()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1312,6 +1416,29 @@ mod tests {
 
         config.with_los_refraction(true).unwrap();
         assert!(config.los_refraction().unwrap());
+        assert!(
+            config
+                .los_refraction_max_tangent_altitude_m()
+                .unwrap()
+                .is_infinite()
+        );
+        config
+            .with_los_refraction_max_tangent_altitude_m(25_000.0)
+            .unwrap();
+        assert_eq!(
+            config.los_refraction_max_tangent_altitude_m().unwrap(),
+            25_000.0
+        );
+        assert!(
+            config
+                .with_los_refraction_max_tangent_altitude_m(-1.0)
+                .is_err()
+        );
+        assert!(
+            config
+                .with_los_refraction_max_tangent_altitude_m(f64::NAN)
+                .is_err()
+        );
 
         config.with_output_los_optical_depth(true).unwrap();
         assert!(config.output_los_optical_depth().unwrap());
@@ -1364,6 +1491,8 @@ mod tests {
             .with_successive_orders_damping(0.85)
             .unwrap()
             .with_successive_orders_altitude_grid_m(&[500.0, 2_500.0, 10_000.0])
+            .unwrap()
+            .with_successive_orders_horizontal_angle_grid_radians(&[-0.3, -0.05, 0.2])
             .unwrap();
         assert_eq!(
             config.successive_orders_relative_tolerance().unwrap(),
@@ -1379,19 +1508,45 @@ mod tests {
             config.successive_orders_altitude_grid_m().unwrap(),
             [500.0, 2_500.0, 10_000.0]
         );
+        assert_eq!(
+            config
+                .successive_orders_horizontal_angle_grid_radians()
+                .unwrap(),
+            [-0.3, -0.05, 0.2]
+        );
 
-        assert!(config
-            .with_successive_orders_relative_tolerance(f64::NAN)
-            .is_err());
+        assert!(
+            config
+                .with_successive_orders_relative_tolerance(f64::NAN)
+                .is_err()
+        );
         assert!(config.with_successive_orders_damping(0.0).is_err());
-        assert!(config
-            .with_successive_orders_altitude_grid_m(&[2_000.0, 1_000.0])
-            .is_err());
+        assert!(
+            config
+                .with_successive_orders_altitude_grid_m(&[2_000.0, 1_000.0])
+                .is_err()
+        );
         config.with_successive_orders_altitude_grid_m(&[]).unwrap();
-        assert!(config
-            .successive_orders_altitude_grid_m()
-            .unwrap()
-            .is_empty());
+        assert!(
+            config
+                .successive_orders_altitude_grid_m()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            config
+                .with_successive_orders_horizontal_angle_grid_radians(&[0.2, -0.2])
+                .is_err()
+        );
+        config
+            .with_successive_orders_horizontal_angle_grid_radians(&[])
+            .unwrap();
+        assert!(
+            config
+                .successive_orders_horizontal_angle_grid_radians()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

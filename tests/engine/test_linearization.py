@@ -314,6 +314,36 @@ def test_engine_linearize_matches_weighting_function_output():
     xr.testing.assert_allclose(lin.jacobian["albedo"], expected["wf_albedo"])
 
 
+def test_engine_linearize_accepts_workspace_preparation_hint():
+    engine, atmosphere = _raw_engine_scenario()
+
+    linearization = engine.linearize(atmosphere, prepare_parameters=("extinction",))
+
+    assert {"extinction", "ssa", "albedo"} <= set(linearization.parameters)
+    selected = linearization.vjp(
+        xr.ones_like(linearization.value), parameters=("extinction",)
+    )
+    assert tuple(selected.data_vars) == ("extinction",)
+
+    with pytest.raises(ValueError, match="Unknown linearization preparation parameter"):
+        engine.linearize(atmosphere, prepare_parameters=("missing",))
+
+
+def test_calculate_radiance_can_skip_derivatives_without_rebuilding_atmosphere():
+    engine, atmosphere = _raw_engine_scenario()
+
+    full = engine.calculate_radiance(atmosphere)
+    radiance_only = engine.calculate_radiance(atmosphere, derivatives=False)
+
+    assert set(radiance_only.data_vars) == {"radiance"}
+    xr.testing.assert_allclose(radiance_only.radiance, full.radiance)
+    assert atmosphere.calculate_derivatives
+    assert "extinction" in engine.linearize(atmosphere).parameters
+
+    with pytest.raises(TypeError, match="derivatives"):
+        engine.calculate_radiance(atmosphere, derivatives="no")  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     "surface",
     [

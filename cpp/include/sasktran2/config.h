@@ -1,8 +1,10 @@
 #pragma once
 
-#include <spdlog/spdlog.h>
+#include <limits>
 #include <utility>
 #include <vector>
+
+#include <spdlog/spdlog.h>
 
 namespace sasktran_disco {
     template <int NSTOKES, int CNSTR> class PersistentConfiguration;
@@ -508,6 +510,19 @@ namespace sasktran2 {
             m_successive_orders_altitude_grid_m = std::move(altitude_grid_m);
         }
 
+        /** Explicit horizontal-angle source grid for Geometry2D successive
+         * orders, in radians. An empty grid selects the evenly spaced grid
+         * controlled by num_do_sza(). */
+        const std::vector<double>&
+        successive_orders_horizontal_angle_grid_radians() const {
+            return m_successive_orders_horizontal_angle_grid_radians;
+        }
+        void set_successive_orders_horizontal_angle_grid_radians(
+            std::vector<double> horizontal_angle_grid_radians) {
+            m_successive_orders_horizontal_angle_grid_radians =
+                std::move(horizontal_angle_grid_radians);
+        }
+
         /**
          *
          * @return The number of incoming points at each diffuse point in the HR
@@ -565,6 +580,17 @@ namespace sasktran2 {
          */
         void set_los_refraction(bool refraction) {
             m_los_refraction = refraction;
+        }
+
+        /** Maximum nominal tangent altitude for LOS refraction. Rays above
+         * this altitude are traced straight. Infinity preserves refraction on
+         * every LOS and is the default. */
+        double los_refraction_max_tangent_altitude_m() const {
+            return m_los_refraction_max_tangent_altitude_m;
+        }
+
+        void set_los_refraction_max_tangent_altitude_m(double altitude_m) {
+            m_los_refraction_max_tangent_altitude_m = altitude_m;
         }
 
         /**
@@ -783,12 +809,15 @@ namespace sasktran2 {
         int m_successive_orders_anderson_depth = 3;
         double m_successive_orders_damping = 1.0;
         std::vector<double> m_successive_orders_altitude_grid_m;
+        std::vector<double> m_successive_orders_horizontal_angle_grid_radians;
 
         bool m_apply_delta_scaling;
 
         bool m_enable_wfs;
 
         bool m_los_refraction;
+        double m_los_refraction_max_tangent_altitude_m =
+            std::numeric_limits<double>::infinity();
         bool m_solar_refraction;
         bool m_ms_refraction;
 

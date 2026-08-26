@@ -400,6 +400,21 @@ impl PyConfig {
     }
 
     #[getter]
+    fn los_refraction_max_tangent_altitude_m(&self) -> PyResult<f64> {
+        self.config
+            .los_refraction_max_tangent_altitude_m()
+            .into_pyresult()
+    }
+
+    #[setter]
+    fn set_los_refraction_max_tangent_altitude_m(&mut self, altitude_m: f64) -> PyResult<()> {
+        self.config
+            .with_los_refraction_max_tangent_altitude_m(altitude_m)
+            .into_pyresult()?;
+        Ok(())
+    }
+
+    #[getter]
     fn get_output_los_optical_depth(&self) -> PyResult<bool> {
         self.config.output_los_optical_depth().into_pyresult()
     }
@@ -546,6 +561,28 @@ impl PyConfig {
     ) -> PyResult<()> {
         self.config
             .with_successive_orders_altitude_grid_m(altitude_grid_m.as_deref().unwrap_or_default())
+            .into_pyresult()?;
+        Ok(())
+    }
+
+    #[getter]
+    fn successive_orders_horizontal_angle_grid_radians(&self) -> PyResult<Option<Vec<f64>>> {
+        let horizontal_angle_grid_radians = self
+            .config
+            .successive_orders_horizontal_angle_grid_radians()
+            .into_pyresult()?;
+        Ok((!horizontal_angle_grid_radians.is_empty()).then_some(horizontal_angle_grid_radians))
+    }
+
+    #[setter]
+    fn set_successive_orders_horizontal_angle_grid_radians(
+        &mut self,
+        horizontal_angle_grid_radians: Option<Vec<f64>>,
+    ) -> PyResult<()> {
+        self.config
+            .with_successive_orders_horizontal_angle_grid_radians(
+                horizontal_angle_grid_radians.as_deref().unwrap_or_default(),
+            )
             .into_pyresult()?;
         Ok(())
     }

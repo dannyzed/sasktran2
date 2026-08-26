@@ -151,8 +151,16 @@ int sk_atmosphere_apply_delta_m_scaling(Atmosphere* atmosphere, int order);
 
 int sk_atmosphere_mark_changed(Atmosphere* atmosphere);
 
+int sk_atmosphere_mark_surface_changed(Atmosphere* atmosphere);
+
 int sk_atmosphere_get_revision(Atmosphere* atmosphere,
                                unsigned long long* revision);
+
+int sk_atmosphere_get_volume_revision(Atmosphere* atmosphere,
+                                      unsigned long long* revision);
+
+int sk_atmosphere_get_instance_id(Atmosphere* atmosphere,
+                                  unsigned long long* instance_id);
 
 // ---------------------
 // SURFACE METHODS
@@ -176,6 +184,12 @@ Surface* sk_surface_create(int nwavel, int nstokes, double* emission);
 void sk_surface_destroy(Surface* surface);
 
 int sk_surface_set_brdf(Surface* surface, BRDF* brdf, double* brdf_args);
+
+/** Copy a C-row-major [horizontal, wavelength] Lambertian albedo field. */
+int sk_surface_set_spatial_lambertian(Surface* surface, const double* albedo,
+                                      int num_horizontal, int num_wavel);
+
+int sk_surface_clear_spatial_lambertian(Surface* surface);
 
 int sk_surface_get_derivative_mapping(Surface* storage, const char* name,
                                       SurfaceDerivativeMapping** mapping);
