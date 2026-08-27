@@ -15,6 +15,12 @@ Its SHA-256 is:
 
 `06b5600ecb0f5a3417c46d226555bc516f5a55ae93b19b6e7b5431e50f8f0459`
 
+The reproducible extraction and validation recipe is maintained in
+`tools/databases/mt-ckd/`. It requires a separately obtained, licensed MT_CKD
+checkout and an externally built compatible probe library; no upstream wrapper
+source is redistributed in this repository. The tool writes the artifacts
+directly to a caller-selected directory.
+
 The upstream double-precision validation spectra are stored only on the data
 server as `continuum/mt_ckd_4_3_reference.bin`, with SHA-256:
 
@@ -31,6 +37,10 @@ on the native 0 to 19,900 cm^-1 grid at 10 cm^-1 spacing. Internally MT_CKD is
 evaluated for a fixed one-metre column, making its optical depth numerically
 equal to extinction in m^-1. Geometric path length is therefore deliberately
 not part of the continuum API.
+
+The low-level compatibility functions include MT_CKD's historical Rayleigh
+term by default. `MTCKDContinuum` requests absorption only so SASKTRAN2's
+dedicated Rayleigh constituent can supply scattering without double counting.
 
 The scalar evaluator uses ordinary `f64` arithmetic. The linearized evaluator
 uses the same generic kernel with forward-mode dual numbers for pressure,

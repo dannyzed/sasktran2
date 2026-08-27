@@ -12,18 +12,16 @@ from sasktran2.constituent.base import Constituent
 from sasktran2.util.interpolation import linear_interpolating_matrix
 
 __all__ = [
-    "MTCKDContinuum",
     "MT_CKD_AER_LICENSE",
     "MT_CKD_WAVENUMBERS_CM_INV",
+    "MTCKDContinuum",
     "mt_ckd",
     "mt_ckd_linearized",
 ]
 
 _MT_CKD_DATA_KEY = "continuum/mt_ckd_4_3.bin"
 _MT_CKD_LICENSE_KEY = "continuum/MT_CKD_LICENSE.txt"
-_MT_CKD_DATA_SHA256 = (
-    "06b5600ecb0f5a3417c46d226555bc516f5a55ae93b19b6e7b5431e50f8f0459"
-)
+_MT_CKD_DATA_SHA256 = "06b5600ecb0f5a3417c46d226555bc516f5a55ae93b19b6e7b5431e50f8f0459"
 _MT_CKD_LICENSE_SHA256 = (
     "3648e3e8a231da514f923409b9b5e41be5e1746e92692af3ce3ac89bc6803b69"
 )
@@ -104,12 +102,21 @@ def mt_ckd(
     vmr_h2o: np.ndarray,
     vmr_co2: np.ndarray,
     vmr_o3: np.ndarray,
+    *,
+    include_rayleigh: bool = True,
 ) -> np.ndarray:
     """Calculate the MT_CKD 4.3 extinction coefficient in m^-1.
 
     The returned columns correspond to
     :data:`MT_CKD_WAVENUMBERS_CM_INV`. The calculation uses a fixed one-metre
     reference column internally, so no geometric path length is an input.
+
+    By default the result includes the historical Rayleigh-scattering term
+    returned by the standalone MT_CKD wrapper, preserving low-level
+    compatibility with :mod:`sasktran2_ext`. Set ``include_rayleigh=False``
+    when only continuum absorption is required. :class:`MTCKDContinuum` always
+    excludes Rayleigh so it can be combined safely with SASKTRAN2's Rayleigh
+    constituent.
 
     The separately licensed AER coefficient data is downloaded from the
     SASKTRAN2 database on first use. Its scientific/research-only license is
@@ -123,6 +130,7 @@ def mt_ckd(
         vmr_co2,
         vmr_o3,
         str(_mt_ckd_data_file()),
+        include_rayleigh,
     )
 
 
@@ -132,6 +140,8 @@ def mt_ckd_linearized(
     vmr_h2o: np.ndarray,
     vmr_co2: np.ndarray,
     vmr_o3: np.ndarray,
+    *,
+    include_rayleigh: bool = True,
 ) -> tuple[np.ndarray, ...]:
     """Calculate MT_CKD extinction and its five analytic Jacobians.
 
@@ -141,6 +151,9 @@ def mt_ckd_linearized(
     :data:`MT_CKD_WAVENUMBERS_CM_INV`. On first use, the separately licensed
     AER coefficient data is downloaded as described in :func:`mt_ckd`; it is
     not covered by SASKTRAN2's MIT license.
+
+    ``include_rayleigh`` has the same compatibility behavior as in
+    :func:`mt_ckd`.
     """
     return _mt_ckd_linearized(
         pressure_pa,
@@ -149,6 +162,7 @@ def mt_ckd_linearized(
         vmr_co2,
         vmr_o3,
         str(_mt_ckd_data_file()),
+        include_rayleigh,
     )
 
 
@@ -160,6 +174,10 @@ class MTCKDContinuum(Constituent):
     options are retained for source compatibility but are no longer used;
     pressure, temperature, H2O, CO2, and O3 derivatives are evaluated
     analytically by the Rust implementation.
+
+    This constituent adds continuum absorption only. MT_CKD's historical
+    Rayleigh term is excluded so scattering can be supplied by SASKTRAN2's
+    dedicated Rayleigh constituent without double counting.
 
     MT_CKD's AER coefficient data is not covered by SASKTRAN2's MIT license.
     On first use it is downloaded from the SASKTRAN2 database after its
@@ -246,11 +264,11 @@ class MTCKDContinuum(Constituent):
             np.ascontiguousarray(o3_vmr, dtype=np.float64),
         )
         if atmo.calculate_derivatives:
-            self._linearized_cache = mt_ckd_linearized(*inputs)
+            self._linearized_cache = mt_ckd_linearized(*inputs, include_rayleigh=False)
             extinction = self._linearized_cache[0]
         else:
             self._linearized_cache = None
-            extinction = mt_ckd(*inputs)
+            extinction = mt_ckd(*inputs, include_rayleigh=False)
         atmo.storage.total_extinction[:] += (
             np.nan_to_num(extinction) @ self._wavenumber_interpolator.T
         )
@@ -303,7 +321,10 @@ class MTCKDContinuum(Constituent):
             self._linearized_cache[1:],
             strict=True,
         ):
-            if derivative_name == "pressure_pa" and not atmo.calculate_pressure_derivative:
+            if (
+                derivative_name == "pressure_pa"
+                and not atmo.calculate_pressure_derivative
+            ):
                 continue
             if (
                 derivative_name == "temperature_k"

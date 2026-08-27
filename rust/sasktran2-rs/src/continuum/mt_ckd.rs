@@ -452,7 +452,7 @@ fn n2_fundamental_coefficients<S: Scalar>(
     result
 }
 
-fn evaluate<S: Scalar>(
+fn evaluate<S: Scalar, const INCLUDE_RAYLEIGH: bool>(
     model: &MtCkd,
     pressure_pa: S,
     temperature: S,
@@ -465,7 +465,14 @@ fn evaluate<S: Scalar>(
         * (S::constant(273.0) / temperature)
         * (ALOSMT * REFERENCE_PATH_LENGTH_CM);
     let dry_amount = initial_total * (S::constant(1.0) - h2o_vmr);
-    let h2o_amount = h2o_vmr * dry_amount;
+    // Preserve MT_CKD's special pure-water convention. The selected branch is
+    // differentiated analytically; as in the upstream piecewise model, the
+    // derivative is undefined exactly at either threshold.
+    let h2o_amount = if (h2o_vmr.value() - 1.0).abs() < 1.0e-5 {
+        initial_total
+    } else {
+        h2o_vmr * dry_amount
+    };
     let co2_amount = co2_vmr * dry_amount;
     let o3_amount = o3_vmr * dry_amount;
     let o2_amount = dry_amount * 0.21;
@@ -584,16 +591,22 @@ fn evaluate<S: Scalar>(
             * (1.0e-20 / (2.686_75e-1 * 1.0e5))
             * (scaled_wavenumber.powi(4) / (9.380_76e2 - 10.8426 * scaled_wavenumber.powi(2)));
 
-        let result = absorption + rayleigh;
+        let result = if INCLUDE_RAYLEIGH {
+            absorption + rayleigh
+        } else {
+            absorption
+        };
         extinction.push(result);
     }
 
     extinction
 }
 
-/// Evaluate MT_CKD 4.3 and all atmospheric Jacobians.
-pub fn calculate_linearized(model: &MtCkd, state: AtmosphericState) -> LinearizedSpectrum {
-    let spectrum = evaluate(
+fn calculate_linearized_impl<const INCLUDE_RAYLEIGH: bool>(
+    model: &MtCkd,
+    state: AtmosphericState,
+) -> LinearizedSpectrum {
+    let spectrum = evaluate::<Dual, INCLUDE_RAYLEIGH>(
         model,
         Dual::variable(state.pressure_pa, Input::Pressure),
         Dual::variable(state.temperature_k, Input::Temperature),
@@ -622,9 +635,38 @@ pub fn calculate_linearized(model: &MtCkd, state: AtmosphericState) -> Linearize
     }
 }
 
-/// Evaluate only the extinction coefficient without derivative propagation.
+/// Evaluate the complete MT_CKD 4.3 standalone spectrum, including its
+/// historical Rayleigh-scattering term, and all atmospheric Jacobians.
+pub fn calculate_linearized(model: &MtCkd, state: AtmosphericState) -> LinearizedSpectrum {
+    calculate_linearized_impl::<true>(model, state)
+}
+
+/// Evaluate MT_CKD 4.3 continuum absorption and all atmospheric Jacobians,
+/// excluding the historical Rayleigh-scattering term.
+pub fn calculate_absorption_linearized(
+    model: &MtCkd,
+    state: AtmosphericState,
+) -> LinearizedSpectrum {
+    calculate_linearized_impl::<false>(model, state)
+}
+
+/// Evaluate the complete MT_CKD 4.3 standalone spectrum, including its
+/// historical Rayleigh-scattering term, without derivative propagation.
 pub fn calculate(model: &MtCkd, state: AtmosphericState) -> Vec<f64> {
-    evaluate(
+    evaluate::<f64, true>(
+        model,
+        state.pressure_pa,
+        state.temperature_k,
+        state.h2o_vmr,
+        state.co2_vmr,
+        state.o3_vmr,
+    )
+}
+
+/// Evaluate only MT_CKD 4.3 continuum absorption, excluding the historical
+/// Rayleigh-scattering term, without derivative propagation.
+pub fn calculate_absorption(model: &MtCkd, state: AtmosphericState) -> Vec<f64> {
+    evaluate::<f64, false>(
         model,
         state.pressure_pa,
         state.temperature_k,
@@ -736,5 +778,39 @@ mod tests {
             calculate(&model, state()),
             calculate_linearized(&model, state()).extinction
         );
+        assert_eq!(
+            calculate_absorption(&model, state()),
+            calculate_absorption_linearized(&model, state()).extinction
+        );
+    }
+
+    #[test]
+    fn pure_water_branch_is_finite_and_linearized() {
+        let model = zero_coefficient_model();
+        let mut pure_water = state();
+        pure_water.h2o_vmr = 1.0;
+
+        let reference = calculate_linearized(&model, pure_water);
+        assert!(reference.extinction.iter().all(|value| value.is_finite()));
+        assert!(reference.d_h2o_vmr.iter().all(|value| value.is_finite()));
+
+        let delta = 1.0e-7;
+        let mut above = pure_water;
+        let mut below = pure_water;
+        above.h2o_vmr += delta;
+        below.h2o_vmr -= delta;
+        let above = calculate(&model, above);
+        let below = calculate(&model, below);
+        for spectral_index in 1..SPECTRAL_POINTS {
+            let numeric = (above[spectral_index] - below[spectral_index]) / (2.0 * delta);
+            let analytic = reference.d_h2o_vmr[spectral_index];
+            let scale = numeric.abs().max(analytic.abs());
+            if scale > 1.0e-18 {
+                assert!(
+                    (numeric - analytic).abs() <= 2.0e-7 * scale,
+                    "index={spectral_index}, numeric={numeric:e}, analytic={analytic:e}"
+                );
+            }
+        }
     }
 }

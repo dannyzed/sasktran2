@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 
 import numpy as np
-
 import sasktran2 as sk
 from sasktran2.constituent.base import Constituent
 
@@ -13,10 +12,10 @@ class _VMRProfile(Constituent):
         self.altitudes_m = altitudes_m
         self.vmr = vmr
 
-    def add_to_atmosphere(self, atmo: sk.Atmosphere):  # noqa: ARG002
+    def add_to_atmosphere(self, atmo: sk.Atmosphere):
         pass
 
-    def register_derivative(self, atmo: sk.Atmosphere, name: str):  # noqa: ARG002
+    def register_derivative(self, atmo: sk.Atmosphere, name: str):
         pass
 
 
@@ -120,6 +119,42 @@ def test_mt_ckd_analytic_jacobians():
         )
 
 
+def test_mt_ckd_pure_water_branch_matches_upstream_and_is_linearized():
+    inputs = list(_inputs())
+    inputs[1] = np.array([296.0])
+    inputs[2] = np.array([1.0])
+    result = sk.mt_ckd_linearized(*inputs)
+
+    assert all(np.all(np.isfinite(field)) for field in result)
+    np.testing.assert_allclose(
+        result[0][0, [1, 100, 240, 800, 1000, 1300, 1990]],
+        [
+            1.7199222942376495,
+            0.3249611845717048,
+            0.02554401487894435,
+            0.000733663141266962,
+            9.614781340354584e-05,
+            5.429603526351588e-06,
+            3.431332907137031e-05,
+        ],
+        rtol=5e-14,
+        atol=1e-16,
+    )
+
+    delta = 1e-7
+    above = [value.copy() for value in inputs]
+    below = [value.copy() for value in inputs]
+    above[2] += delta
+    below[2] -= delta
+    numeric = (sk.mt_ckd(*above) - sk.mt_ckd(*below)) / (2.0 * delta)
+    np.testing.assert_allclose(
+        result[3][:, 1:],
+        numeric[:, 1:],
+        rtol=3e-6,
+        atol=1e-12,
+    )
+
+
 def test_full_spectra_match_mt_ckd_4_3_double_precision_reference():
     reference_path = sk.database.StandardDatabase().path(
         "continuum/mt_ckd_4_3_reference.bin"
@@ -183,9 +218,7 @@ def test_constituent_adds_extinction_and_analytic_mappings():
     atmosphere.pressure_pa = np.array([101_325.0, 50_000.0, 8_000.0])
     atmosphere.temperature_k = np.array([288.15, 250.0, 220.0])
     atmosphere["H2O"] = _VMRProfile(altitudes, np.array([0.01, 0.002, 5e-5]))
-    atmosphere["CO2"] = _VMRProfile(
-        altitudes, np.array([400e-6, 420e-6, 380e-6])
-    )
+    atmosphere["CO2"] = _VMRProfile(altitudes, np.array([400e-6, 420e-6, 380e-6]))
     atmosphere["O3"] = _VMRProfile(altitudes, np.array([2e-6, 1e-6, 5e-6]))
     atmosphere["continuum"] = sk.continuum.MTCKDContinuum()
 
@@ -197,6 +230,7 @@ def test_constituent_adds_extinction_and_analytic_mappings():
         atmosphere["H2O"].vmr,
         atmosphere["CO2"].vmr,
         atmosphere["O3"].vmr,
+        include_rayleigh=False,
     )
     indices = (wavenumbers / 10.0).astype(int)
     np.testing.assert_allclose(
@@ -250,12 +284,12 @@ def test_constituent_without_derivatives_uses_value_only_path(monkeypatch):
     value_calls = 0
     value_function = sk.continuum.mt_ckd
 
-    def tracked_value(*args):
+    def tracked_value(*args, **kwargs):
         nonlocal value_calls
         value_calls += 1
-        return value_function(*args)
+        return value_function(*args, **kwargs)
 
-    def unexpected_linearized(*args):  # noqa: ARG001
+    def unexpected_linearized(*args, **kwargs):
         msg = "the linearized MT_CKD path should not be evaluated"
         raise AssertionError(msg)
 
@@ -322,6 +356,7 @@ def test_species_derivative_mapping_chains_to_profile_grid():
                 expected_interpolator @ above,
                 atmosphere["CO2"].vmr,
                 atmosphere["O3"].vmr,
+                include_rayleigh=False,
             )[:, spectral_indices]
             - sk.mt_ckd(
                 atmosphere.pressure_pa,
@@ -329,10 +364,109 @@ def test_species_derivative_mapping_chains_to_profile_grid():
                 expected_interpolator @ below,
                 atmosphere["CO2"].vmr,
                 atmosphere["O3"].vmr,
+                include_rayleigh=False,
             )[:, spectral_indices]
         ) / (2.0 * delta)
         analytic = (
-            mapping.d_extinction
-            * expected_interpolator[:, parameter_index, np.newaxis]
+            mapping.d_extinction * expected_interpolator[:, parameter_index, np.newaxis]
         )
         np.testing.assert_allclose(analytic, numeric, rtol=3e-5, atol=1e-12)
+
+
+def test_constituent_excludes_legacy_rayleigh_term():
+    altitudes = np.array([0.0, 10_000.0])
+    wavenumber = np.array([10_000.0])
+    geometry = sk.Geometry1D(
+        cos_sza=0.6,
+        solar_azimuth=0.0,
+        earth_radius_m=6_372_000.0,
+        altitude_grid_m=altitudes,
+        interpolation_method=sk.InterpolationMethod.LinearInterpolation,
+        geometry_type=sk.GeometryType.Spherical,
+    )
+    atmosphere = sk.Atmosphere(
+        geometry,
+        sk.Config(),
+        wavenumber_cminv=wavenumber,
+        calculate_derivatives=False,
+    )
+    atmosphere.pressure_pa = np.array([101_325.0, 50_000.0])
+    atmosphere.temperature_k = np.array([288.15, 250.0])
+    atmosphere["H2O"] = _VMRProfile(altitudes, np.array([0.01, 0.002]))
+    atmosphere["CO2"] = _VMRProfile(altitudes, np.array([400e-6, 420e-6]))
+    atmosphere["O3"] = _VMRProfile(altitudes, np.array([2e-6, 1e-6]))
+    atmosphere["continuum"] = sk.continuum.MTCKDContinuum()
+
+    atmosphere.internal_object()
+
+    inputs = _inputs()
+    full = sk.mt_ckd(*inputs)[0, 1000]
+    absorption = sk.mt_ckd(*inputs, include_rayleigh=False)[0, 1000]
+    assert full > 5.0 * absorption
+    np.testing.assert_allclose(
+        atmosphere.storage.total_extinction[0, 0],
+        absorption,
+        rtol=2e-14,
+    )
+
+
+def test_constituent_supports_expanded_profiles_in_2d_atmosphere():
+    altitudes = np.array([0.0, 10_000.0, 30_000.0])
+    horizontal_angles = np.array([-0.2, 0.3])
+    wavenumbers = np.array([1000.0, 10_000.0])
+    geometry = sk.Geometry2D(
+        cos_sza=0.6,
+        solar_azimuth=0.0,
+        earth_radius_m=6_372_000.0,
+        altitude_grid_m=altitudes,
+        horizontal_angle_grid_radians=horizontal_angles,
+    )
+    config = sk.Config()
+    config.num_streams = 2
+    atmosphere = sk.Atmosphere(
+        geometry,
+        config,
+        wavenumber_cminv=wavenumbers,
+        calculate_derivatives=True,
+    )
+    pressure = np.array([101_325.0, 50_000.0, 8_000.0])
+    temperature = np.array([288.15, 250.0, 220.0])
+    h2o = np.array([0.01, 0.002, 5e-5])
+    co2 = np.array([400e-6, 420e-6, 380e-6])
+    o3 = np.array([2e-6, 1e-6, 5e-6])
+    atmosphere.pressure_pa = pressure
+    atmosphere.temperature_k = temperature
+    atmosphere["H2O"] = _VMRProfile(altitudes, h2o)
+    atmosphere["CO2"] = _VMRProfile(altitudes, co2)
+    atmosphere["O3"] = _VMRProfile(altitudes, o3)
+    atmosphere["continuum"] = sk.continuum.MTCKDContinuum()
+
+    atmosphere.internal_object()
+
+    repeats = len(horizontal_angles)
+    low_level = sk.mt_ckd_linearized(
+        np.tile(pressure, repeats),
+        np.tile(temperature, repeats),
+        np.tile(h2o, repeats),
+        np.tile(co2, repeats),
+        np.tile(o3, repeats),
+        include_rayleigh=False,
+    )
+    spectral_indices = (wavenumbers / 10.0).astype(int)
+    np.testing.assert_allclose(
+        atmosphere.storage.total_extinction,
+        low_level[0][:, spectral_indices],
+        rtol=2e-14,
+    )
+
+    mapping = atmosphere.storage.get_derivative_mapping("wf_continuum_H2O_vmr")
+    np.testing.assert_allclose(
+        mapping.d_extinction,
+        low_level[3][:, spectral_indices],
+        rtol=2e-14,
+        atol=1e-18,
+    )
+    np.testing.assert_allclose(
+        mapping.interpolator,
+        np.tile(np.eye(altitudes.size), (repeats, 1)),
+    )

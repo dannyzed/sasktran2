@@ -4,7 +4,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use sasktran2_rs::continuum::mt_ckd::{
-    calculate, calculate_linearized, AtmosphericState, LinearizedSpectrum, MtCkd, OUTPUT_POINTS,
+    AtmosphericState, LinearizedSpectrum, MtCkd, OUTPUT_POINTS, calculate, calculate_absorption,
+    calculate_absorption_linearized, calculate_linearized,
 };
 use std::sync::OnceLock;
 
@@ -78,6 +79,7 @@ pub fn mt_ckd_py<'py>(
     vmr_co2: PyReadonlyArray1<'py, f64>,
     vmr_o3: PyReadonlyArray1<'py, f64>,
     data_file: &str,
+    include_rayleigh: bool,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let model = model(data_file)?;
     let states = states(pressure_pa, temperature_k, vmr_h2o, vmr_co2, vmr_o3)?;
@@ -85,7 +87,13 @@ pub fn mt_ckd_py<'py>(
     let spectra: Vec<_> = py.detach(|| {
         states
             .into_par_iter()
-            .map(|state| calculate(model, state))
+            .map(|state| {
+                if include_rayleigh {
+                    calculate(model, state)
+                } else {
+                    calculate_absorption(model, state)
+                }
+            })
             .collect()
     });
     Ok(array_from_rows(spectra, row_count).into_pyarray(py))
@@ -111,6 +119,7 @@ pub fn mt_ckd_linearized_py<'py>(
     vmr_co2: PyReadonlyArray1<'py, f64>,
     vmr_o3: PyReadonlyArray1<'py, f64>,
     data_file: &str,
+    include_rayleigh: bool,
 ) -> PyResult<LinearizedArrays<'py>> {
     let model = model(data_file)?;
     let states = states(pressure_pa, temperature_k, vmr_h2o, vmr_co2, vmr_o3)?;
@@ -118,7 +127,13 @@ pub fn mt_ckd_linearized_py<'py>(
     let spectra: Vec<LinearizedSpectrum> = py.detach(|| {
         states
             .into_par_iter()
-            .map(|state| calculate_linearized(model, state))
+            .map(|state| {
+                if include_rayleigh {
+                    calculate_linearized(model, state)
+                } else {
+                    calculate_absorption_linearized(model, state)
+                }
+            })
             .collect()
     });
 
